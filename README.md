@@ -35,33 +35,61 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 
 ## 安装
 
-1. 在 `C:\Users\zhoujin\.dsh\profiles\web\package.json` 的
-   `dsh.profile.bundles` 与 `dependencies` 中加入本包（`link:` 指向本目录）。
-2. 在 profile 目录执行 `pnpm install`。
-3. **安装预设**：把本仓库 `preset/code-pipeline/` 拷贝到
-   `$DSH_HOME\.agent-presets\` 下（见下节「预设文件」，插件不会替你做这一步）。
-4. 重启 web 启动（bundle 插件双层加载，需要重启）。
+### 方式一：一行命令安装（推荐，GitHub 分发）
+
+```bash
+dsh plugin --profile web add github:ErrorLst/dsh-code-pipeline
+```
+
+- 该命令在 web profile 下执行 `pnpm add github:ErrorLst/dsh-code-pipeline`；安装成功后
+  reconcile 会读取包内 `dsh.bundle.patch` 声明，自动把
+  `@dsh-external/dsh-code-pipeline` 追加进 `dsh.profile.bundles`（**无需手动登记**）。
+- 重启 `dsh web` 即挂载生效（bundle 层在启动时组合，客户端 bundle 在启动时扫描）。
+- **首次启动自动安装预设**：检测到 `$DSH_HOME/.agent-presets/code-pipeline` 缺失时，
+  插件自动从包内 `preset/code-pipeline/` 拷贝（幂等；已安装则跳过，**绝不覆盖**）。
+
+### 方式二：本地开发安装
+
+```bash
+dsh plugin --profile web add link:<本仓库绝对路径>
+# 或：dsh plugin --profile web add <本仓库绝对路径>
+```
+
+- 与方式一相同：`dsh plugin add` 自动完成依赖安装与 bundle 登记，无需手动编辑
+  `dsh.profile.bundles`；默认 profile 名为 `web`，其他用
+  `dsh plugin --profile <name> add ...`。
+- 启动后预设同样自动安装；本仓库以 `link:` 挂载，改 `lib/` 后重启 dsh 生效，
+  客户端改动刷新页面即可。
+
+### 卸载
+
+```bash
+dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
+```
+
+从依赖与 bundle 层移除；预设目录（`$DSH_HOME/.agent-presets/code-pipeline`）**不会**被
+删除，需要时手动删除即可。
 
 ## 预设文件（preset/）
 
 `code-pipeline` 预设的组合内容（主代理 persona 与流水线协议、Code Mode 展示、
 禁用通用 `subagent`/`subagent_fork`、delegation 组等）**随本仓库在
-`preset/code-pipeline/` 目录维护**（`agent.cordis.yml` + `preset.yml`），但——
+`preset/code-pipeline/` 目录维护**（`agent.cordis.yml` + `preset.yml`）。
 
-> **插件不会安装、更新或改写该预设。** 安装与升级都由你**手动拷贝**到 dsh 的
-> agent-presets 目录，预设仍是 dsh 预设机制下的普通组合文件。
-
-- 首次安装：
+- **自动安装**：插件启动时若发现 `$DSH_HOME/.agent-presets/code-pipeline` 缺失，
+  会从包内 `preset/code-pipeline/` 自动拷贝（首次安装无需手动步骤；已存在则跳过，
+  **绝不覆盖**——升级时不会悄悄改写你的预设）。
+- **手动补装**（自动安装失败/被跳过时）：
 
   ```powershell
   Copy-Item -Recurse -Force "$PSScriptRoot\preset\code-pipeline" "$env:DSH_HOME\.agent-presets\code-pipeline"
   ```
 
-  （`$env:DSH_HOME` 默认 `C:\Users\<user>\.dsh`；等价于把 `preset\code-pipeline\` 目录内容
-  放到 `C:\Users\<user>\.dsh\.agent-presets\code-pipeline\`。）
+  （`$env:DSH_HOME` 默认 `C:\Users\<user>\.dsh`。）
 
-- 更新预设：用仓库新版本**整目录覆盖** `$DSH_HOME\.agent-presets\code-pipeline\`
-  （`Copy-Item -Recurse -Force`，保持 `agent.cordis.yml` 与 `preset.yml` 都更新）。
+- **升级同步**：插件升级后若行为对不上（工具名/规则文本变化），用仓库新版本
+  **整目录覆盖** `$DSH_HOME\.agent-presets\code-pipeline\`（`Copy-Item -Recurse -Force`）；
+  `diff -r` 两份目录即可先确认差异。
 
 - 生效时机：**新会话/新子代理**生效（dsh 的 standing 挂载按组合文件的变化时间戳
   重建）；**已经在运行的会话不会**自动切换——需要换新预设请开新会话。
