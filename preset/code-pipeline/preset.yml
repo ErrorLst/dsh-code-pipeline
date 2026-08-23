@@ -1,0 +1,2 @@
+name: code agent
+description: 基于 PTC 模式（Code Mode SDK）的子代理流水线：subagent_plan（GLM-5.3 规划）/ subagent_impl（V4-Flash 实现）/ subagent_review（GLM-5.3 评审）三个派发工具（plan/review 各带 V4-Pro fallback 孪生），可独立或任意组合（仅规划 / 仅实现 / 仅评审+主代理合并 / 完整 plan→门→impl↔review），独立目标可并行派发；侦察/评审只读，已屏蔽通用 subagent 派发工具。

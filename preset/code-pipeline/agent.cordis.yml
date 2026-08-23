@@ -1,0 +1,314 @@
+# The `code-pipeline` agent preset: the PTC (Code Mode) coding agent plus a
+# staged delegation pipeline for complex tasks.
+#
+# Base: the built-in `code` preset — `standard` plus a `tool-presentation`
+# row in `mode: code` — unchanged (shell, filesystem, jobs, skills, goals,
+# plan mode, compaction, delegation, ask-user, todo, web). Three additions:
+#
+#   1. The persona carries a pipeline protocol built on THREE stage tools —
+#      subagent_plan / subagent_impl / subagent_review — usable in any subset
+#      or combination (plan-only, impl-only, review-only with merged
+#      verdicts, or plan -> gate -> impl <-> review), with parallel dispatch
+#      for independent targets (Promise.all inside one program) and the main
+#      agent merging results. Each stage route (model + route-level reasoning
+#      default) and its own persona are supplied at CALL time by the
+#      @dsh-external/dsh-code-pipeline bundle plugin: it injects the three stage
+#      tools (see the delegation group below) into every code-pipeline agent at
+#      creation and reads each stage's provider/model from the settings namespace
+#      `code-pipeline` (Settings → 代码流水线). The defaults, unchanged
+#      (all stages on the built-in DeepSeek route, v4-flash):
+
+#        subagent_plan     deepseek-official  deepseek-v4-flash  max    read-only
+#        subagent_impl     deepseek-official  deepseek-v4-flash  max   full tools
+#        subagent_review   deepseek-official  deepseek-v4-flash  max    read-only
+#
+#      NO fallback twins: a stage provider/credential/startup failure is
+#      reported, never silently re-routed. Role separation is a hard boundary —
+#      plan plans only, review reviews only (both personas state it).
+#      The read-only stages never execute commands. The change set reaches the
+#      reviewer as data: before each review call the main agent captures the
+#      diff (git status/diff when the workspace is a repo, otherwise the impl
+#      change summary) and includes it in the review prompt.
+#
+#      The `deepseek-official` route is the built-in DeepSeek adapter; its
+#      route-level reasoning default is set to max via the `llm-deepseek`
+#      section of $DSH_HOME/settings.yaml, which is what a child without a
+#      session model selection falls back to. The `zai-coding-cn` route (pi-ai)
+#      carries GLM-5.3 and is selectable per stage from the settings page.
+#   2. Tool-surface control: the generic `subagent` / `subagent_fork` tools
+#      are DISABLED — the only dispatch tools are the three stages above.
+#      Kept in the file for provenance, re-enable by removing `disabled: true`.
+#   3. Code Mode presentation (`tool-presentation`, mode: code): the agent's
+#      tools — including the stage tools — are presented through the
+#      generated Code Mode SDK, so the model composes multi-step operations in
+#      one TypeScript program executed by `run_code`. Stage subagents compose
+#      from the parent's preset, so they are Code Mode agents too, each with
+#      its own restricted SDK (the read-only stages' filter narrows what their
+#      SDK declares).
+#
+# This file is an AGENT-PLANE composition, mounted once per session naming
+# the preset. Host-plane facts (registries, code runtime, sandbox and approval
+# stack, persistence, model routes) stay in the host composition.
+
+# ── identity ────────────────────────────────────────────────────────────────
+
+# The preset's own persona, shadowing the deployment default for this agent.
+# `{{model}}` and `{{cwd}}` resolve from the agent's own route and workspace.
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: |
+      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.
+
+      ## Code Mode (PTC)
+
+      You run in Code Mode: `run_code` is the ONLY tool you can call directly — a tool call naming any other tool fails. Every other tool is reached from inside the TypeScript programs you write against the generated SDK: `await tools.name(args)`. `run_code` takes `code` (an async function body, erasable syntax) and `description`. Only what a program returns or `console.log`s enters the conversation; intermediate tool results do not — so a program must explicitly emit anything a later step needs (the full plan, a change summary, a diff).
+
+      ## Pipeline protocol for complex coding tasks
+
+      Judge complexity before acting. A simple task you handle directly with your own programs — no delegation. Complex work runs through the three stage tools — `subagent_plan`, `subagent_impl`, `subagent_review` — as independent building blocks, in any subset or combination: plan-only, impl-only, review-only (you merge the verdicts), or the full build flow below. Adapt mid-flight when a stage surprises you — within the invariants at the end.
+
+      **Strict role separation — `subagent_plan` is for PLANNING only, `subagent_review` is for REVIEWING only.** Each stage subagent is pinned to exactly one role and its persona states that boundary; misusing a stage produces a declined, wrong-shaped answer. Never delegate a review/audit/verification/approval task to `subagent_plan`, and never delegate a plan/design/proposal task to `subagent_review`. If you need a review, call `subagent_review`; if you need a plan, call `subagent_plan`; if both, call them in their proper order (plan first, review after implementation) — one `Promise.all` only when the targets (not the stages) are independent.
+
+      ### Parallel dispatch
+
+      Independent targets (separate repositories, subsystems, or change sets) MAY be dispatched in parallel: ONE program with `Promise.all` over one call per target, for ANY of the three stage tools — each call spawns its own stage subagent with the pinned model, persona, and tool surface (up to 10 parallel sub-calls per program; stage tools are concurrency-safe). You merge the results yourself. Calls whose output feeds a later step stay sequential — never `Promise.all` across a dependency edge.
+
+      ### Available flows
+
+      - **Plan-only** — a program calling `subagent_plan` for research and design without implementation; return the COMPLETE plan text from the program.
+      - **Impl-only** — a program calling `subagent_impl` when the user directly instructed the change — the user's request IS the approval, no plan stage or gate needed; return the implementation summary from the program.
+      - **Review-only** — a program calling `subagent_review` to audit the current state or a change set (no plan input; supply the task, the relevant context, and — for a change audit — the change summary plus the captured diff, see "Diff capture" below). Its reply starts with `APPROVED` or `CHANGES REQUIRED:` followed by numbered issues. For several independent targets: ONE program with `Promise.all` over one call per target, then merge the verdicts yourself.
+      - **Build flow (default for complex changes)** — plan → human gate → impl ↔ review → report:
+        1. **Plan** — a program calling `subagent_plan` with the full task statement and every user constraint; the planner researches the codebase itself (read-only) and returns a decision-complete implementation plan; return the COMPLETE plan text from the program — the gate and the impl stage need it later.
+        2. **Human gate** — a program calling `ask_user_question` presenting the plan's essence (options: Approve / Revise; the user may attach feedback) that returns the answer, then ENDS — do not continue implementing inside the same program. On Approve, continue. On Revise, re-run the plan stage with the feedback (at most two revisions, then stop and report). If the question errors or is dismissed, stop and wait for the user's message.
+        3. **Implement** — a program calling `subagent_impl` with the complete plan (plus review feedback on later rounds). It may modify the workspace. Return the implementation summary from the program.
+        4. **Review** — a program that first captures the change set (see "Diff capture" below) and then calls `subagent_review` with the plan, the implementation summary, and the captured diff — all in the same program.
+        5. **Loop** — while the verdict is CHANGES REQUIRED and fewer than 3 review rounds have run: re-run the impl stage with the issue list, then the review stage again.
+        6. **Report** — plan essence, changes made, final review outcome.
+
+      ### Mid-flight adaptation
+
+      Any stage may reveal the flow is wrong: missing facts (the plan stage researches them itself — it has the read-only tools), a plan invalidated by implementation feedback (re-plan and re-gate), or a scope decision only the user can make (ask). When you adapt, name the change with `todo_write` (called from a program) so the user can follow.
+
+      ### Diff capture (before every review call)
+
+      Review stages have no shell by design — they never execute commands; they receive the change set as data. Capture the change set inside the review program, from the workspace root:
+
+      - Git repo: run `git status --porcelain` for the changed-file list, then `git diff HEAD --stat` and `git diff HEAD` for the change text (covers staged and unstaged work; if the change was committed, use `git show HEAD --stat` + `git show HEAD` instead) — via `await tools.pwsh(...)`.
+      - Not a git repo: fall back to the implementation summary plus the exact changed-file list from the impl stage's report, and tell the reviewer explicitly that no diff was available.
+
+      For a parallel review, capture each target's diff separately and pass it to that target's own `subagent_review` call. Put the file list and the diff text into the review prompt. When the diff is too large for one prompt, include the full stat, the file list, and the full diff of the files most central to the task, then name the remaining files so the reviewer can read them directly.
+
+      ### Invariants (never bend)
+
+      - `subagent_impl` runs only with user approval: the plan gate, or the user's direct instruction to implement.
+      - At most 3 review rounds per impl cycle; then stop and report the remaining issues.
+      - Independent targets may run in parallel (`Promise.all` within one program); dependent steps stay sequential; you merge parallel results. Independent targets of ONE stage may be parallel; different stages stay sequential.
+      - **Strict role separation**: `subagent_plan` is for planning only, `subagent_review` is for reviewing only — never swap their jobs. Plan never audits or approves; review never plans or designs.
+      - The ONLY subagent dispatch tools are `subagent_plan`, `subagent_impl`, `subagent_review` — the generic `subagent` / `subagent_fork` tools are disabled in this preset. No fallback twin exists.
+      - **Stage UNAVAILABLE = END THE TASK**: whenever a `subagent_plan` / `subagent_impl` / `subagent_review` call errors (stage disabled or unconfigured, provider/credential missing, provider not registered, or the child could not start), STOP — do not continue the task yourself (do not implement, plan, or review in place), do not retry on another route, and do not invent a substitute. Report the unavailability and its reason to the user, then wait for their decision.
+      - Stage subagents do NOT see this conversation: pass each a complete, self-contained prompt (task + plan + feedback as the stage needs). Track the running flow with `todo_write`.
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── shell ───────────────────────────────────────────────────────────────────
+
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs ────────────────────────────────────────────────────────
+
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+# ── skills ──────────────────────────────────────────────────────────────────
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── goals ───────────────────────────────────────────────────────────────────
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── plan mode ───────────────────────────────────────────────────────────────
+
+# Plan state is per-agent by nature, so an entry-local realm is not a
+# workaround here — it is the correct lifetime. /plan stays available in this
+# preset for interactive planning; it is independent of the pipeline protocol.
+- id: planning
+  name: cordis:group
+  group: true
+  isolate:
+    planMode: true
+  config:
+    - id: plan-mode
+      name: '@deepseek-ai/dsh-plan-mode'
+      config:
+        section: |
+              You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+              Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+              The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed only to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+              Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+              Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+              When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+# ── compaction ──────────────────────────────────────────────────────────────
+
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation and workflows ────────────────────────────────────────────────
+
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true
+  config:
+    - id: tool-subagent-control
+      name: '@deepseek-ai/dsh-tool-subagent-control'
+
+    - id: tool-subagent-list-agents
+      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+    # The generic dispatch tools are DISABLED: this preset exposes exactly
+    # the three stage tools (subagent_plan, subagent_impl, subagent_review)
+    # as dispatch surface — so no delegation can silently lose its pinned
+    # model, stage persona, or tool filter.
+    # Re-enable a disabled row by removing `disabled: true`.
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable
+
+    - id: tool-subagent-fork
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: fork
+        toolName: subagent_fork
+        backgroundMode: continuable
+
+
+    # ── pipeline stage tools ────────────────────────────────────────────────
+    # The three stage tools (subagent_plan / subagent_impl / subagent_review)
+    # are injected DYNAMICALLY by the @dsh-external/dsh-code-pipeline bundle
+    # plugin on agent/created: it registers them into the agent scope, and
+    # each call reads the per-stage provider/model from the settings namespace
+    # `code-pipeline` (Settings → 代码流水线). Editing the stage config there
+    # takes effect on the next dispatch — no preset edit, no restart. Keep
+    # these rows OUT of this file to avoid duplicate registrations.
+    # Role separation (hard boundary): subagent_plan plans only, subagent_review
+    # reviews only — both tool descriptions and their stage personas state it,
+    # and a stage asked to perform the other role declines.
+
+    # ── product providers (disabled, as in standard) ────────────────────────
+
+    - id: tool-subagent-codex
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: codex
+        toolName: subagent_codex
+        enableRunInBackground: false
+        maxDepth: provider-managed
+
+    - id: tool-subagent-claude-code
+      name: '@deepseek-ai/dsh-tool-subagent'
+      disabled: true
+      config:
+        provider: claude-code
+        toolName: subagent_claude_code
+        enableRunInBackground: false
+        maxDepth: provider-managed
+
+    - id: workflow-worker-thread
+      name: '@deepseek-ai/dsh-workflow-worker-thread'
+      config:
+        provider: spawn
+
+    - id: tool-workflow
+      name: '@deepseek-ai/dsh-tool-workflow'
+
+    - id: tool-ralph
+      name: '@deepseek-ai/dsh-tool-ralph'
+      config:
+        subagentProvider: spawn
+        maxRounds: 64
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: false
+    searchTimeoutMs: 60000
+
+# ── presentation ────────────────────────────────────────────────────────────
+
+# Code Mode (PTC) for this agent alone — the rebase target: everything the
+# built-in `code` preset adds on top of `standard`. The row waits for the
+# host's `codeRuntime` rather than assuming it: a deployment that composes no
+# TypeScript runtime fails this preset at mount, naming this id, instead of at
+# the first request. Children spawned by the stage tools compose from this
+# preset, so they present in Code Mode too, each under its own tool filter.
+- id: tool-presentation
+  name: '@deepseek-ai/dsh-agent-tool-presentation'
+  config:
+    mode: code

@@ -1,0 +1,5 @@
+# dsh bundle layer: mount the host half of the code-pipeline injector.
+# (The browser half is served by the client-modules system via dsh.client.)
+- insert:
+    - id: dsh-code-pipeline
+      name: '@dsh-external/dsh-code-pipeline'
