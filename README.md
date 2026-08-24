@@ -97,8 +97,7 @@ dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
 - 插件与预设的版本对应：插件只保证与**仓库内 preset/ 副本**一致的那一版预设协同
   工作。升级插件后若发现行为对不上（如工具名、规则文本变化），优先检查
   `$DSH_HOME\.agent-presets\code-pipeline\` 是否落后于仓库的 `preset/code-pipeline\`——
-  `diff -r` 两份目录即可确认。插件启动时如果发现目标预设目录不存在，会打一条
-  warning 提示安装。
+  `diff -r` 两份目录即可确认。插件启动时若发现目标预设目录缺失，会自动安装（见上）。
 
 ## 预设要求
 
@@ -108,6 +107,19 @@ dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
   `subagent`/`subagent_fork`、delegation 组）保持仓库 `preset/` 副本的样子。
 - 仓库内的 `preset/code-pipeline/` 就是唯一维护源：对预设的任何修改请先改这里，
   再同步拷贝到 `$DSH_HOME\.agent-presets\code-pipeline\`。
+
+## 人工闸门（plan 之后）
+
+build flow 的闸门是**对话内自然闸门**，不用 `ask_user_question` 弹卡片（卡片不支持
+Markdown 渲染，长计划会挤压展示）：
+
+1. plan 阶段返回后，主代理把**完整计划**以正常 Markdown 回复直接呈现在对话中，
+   然后结束回合等待用户输入；
+2. 用户下一条消息即闸门答复：**批准**（approve / 批准 / 同意 / ok / 可以 / 开始 /
+   没问题 等，且无新增要求）→ 进入实现阶段；**其他任何内容**视为修订反馈 → 并入计划
+   重新呈现（最多两轮修订后停止并报告）。
+
+运行规则以 `preset/code-pipeline/agent.cordis.yml` 的 pipeline protocol 为准。
 
 ## 默认值
 
