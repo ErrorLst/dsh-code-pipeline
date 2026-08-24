@@ -121,6 +121,20 @@ Markdown 渲染，长计划会挤压展示）：
 
 运行规则以 `preset/code-pipeline/agent.cordis.yml` 的 pipeline protocol 为准。
 
+## 长任务与后台派发
+
+阶段工具**没有工具级超时**（未声明 `timeoutMs`，不会触发官方 timeout policy）；但前台等待
+受当前回合/调度生命周期约束，长跑阶段可能被回合边界截断（如单回合 20 分钟限制）。
+
+- **前台模式（默认）**：`run_in_background: false` 忽略/省略——等待阶段结果，超时边界只来自
+  回合本身；
+- **后台模式**：`run_in_background: true`——立即返回
+  `{"kind":"continuable","subagentId":"..."}` 并结束回合；阶段子代理独立会话继续运行，
+  **完成后 runtime 自动向本会话发送通知**（含结果与最终回复）；
+- **状态可见**：`list_agents`（running / idle / ready）、`send_message` 继续子代理、
+  `subagent.history` 取完整记录，GUI 子代理视图同步展示；
+- 长任务（预计超过当前回合可承受时长）请用后台模式，收到完成通知后再继续下一步。
+
 ## 默认值
 
 所有阶段默认统一走 `deepseek-official` / `deepseek-v4-flash`：

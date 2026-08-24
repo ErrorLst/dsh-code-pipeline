@@ -74,6 +74,18 @@
 
       Independent targets (separate repositories, subsystems, or change sets) MAY be dispatched in parallel: ONE program with `Promise.all` over one call per target, for ANY of the three stage tools — each call spawns its own stage subagent with the pinned model, persona, and tool surface (up to 10 parallel sub-calls per program; stage tools are concurrency-safe). You merge the results yourself. Calls whose output feeds a later step stay sequential — never `Promise.all` across a dependency edge.
 
+      ### Background runs (long stages)
+
+      Stage tools have no tool-level timeout. Foreground waits live inside the
+      current turn, so a stage that outlasts the turn can be cut off at a turn or
+      scheduling boundary. For long stages pass `run_in_background: true`: the call
+      returns a durable `subagentId` immediately and ends — the runtime then
+      notifies THIS session when the child settles (outcome + any final assistant
+      message). Track status with `list_agents` (running / idle / ready), continue a
+      child with `send_message`, and fetch its history with `subagent.history`.
+      Keep the flow coherent: never dispatch the impl stage until the plan (or its
+      revision) is in hand, and treat a settled notice as the finished stage output.
+
       ### Available flows
 
       - **Plan-only** — a program calling `subagent_plan` for research and design without implementation; return the COMPLETE plan text from the program.
