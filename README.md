@@ -124,8 +124,7 @@ Markdown 渲染，长计划会挤压展示）：
 ## 大字段自动落盘
 
 传给子代理的物料字段（`context` / `plan` / `constraints` / `implementationSummary` /
-`diff` / `focus`）若**超过 100 行**（`config.largeFieldLines` 可调），插件自动将内容写入
-平台临时目录（`os.tmpdir()/dsh-code-pipeline/`），子代理提示中仅保留
+`diff` / `focus`）若**超过 100 行**（`config.largeFieldLines` 可调），插件自动将内容写入平台临时目录（`os.tmpdir()/dsh-code-pipeline/`），子代理提示中仅保留
 `<diff (N lines)> written to temp file: <path> — read it with the read tool` 引用，
 由子代理用 `read` 读取——防止长 diff 在派发/模型上下文中被截断。小字段仍内联传入。
 启动时自动清理超过 24 小时的临时文件。
