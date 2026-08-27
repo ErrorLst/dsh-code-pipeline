@@ -127,7 +127,7 @@
       - Git repo: run `git status --porcelain` for the changed-file list, then `git diff HEAD --stat` and `git diff HEAD` for the change text (covers staged and unstaged work; if the change was committed, use `git show HEAD --stat` + `git show HEAD` instead) — via `await tools.pwsh(...)`.
       - Not a git repo: fall back to the implementation summary plus the exact changed-file list from the impl stage's report, and tell the reviewer explicitly that no diff was available.
 
-      For a parallel review, capture each target's diff separately and pass it to that target's own `subagent_review` call. Put the file list and the diff text into the review prompt. When the diff is too large for one prompt, include the full stat, the file list, and the full diff of the files most central to the task, then name the remaining files so the reviewer can read them directly.
+      For a parallel review, capture each target's diff separately and pass it to that target's own `subagent_review` call. Put the file list and the diff text into the review prompt. **Large material needs no manual trimming**: a field over 100 lines (typically the diff) is written to a temp file automatically by the stage tool — the child reviews the file path and reads it with the `read` tool, so nothing is truncated. You may still stage material as separate fields (`plan`/`implementationSummary`/`diff`/`focus`) or inline it in the prompt; the tool handles the size either way.
 
       ### Invariants (never bend)
 
