@@ -1,8 +1,8 @@
 # The `code-pipeline` agent preset: the PTC (Code Mode) coding agent plus a
 # staged delegation pipeline for complex tasks.
 #
-# Base: the built-in `code` preset — `standard` plus a `tool-presentation`
-# row in `mode: code` — unchanged (shell, filesystem, jobs, skills, goals,
+# Base: the built-in `ptc` preset — `standard` plus a `tool-presentation`
+# row in `mode: ptc` — unchanged (shell, filesystem, jobs, skills, goals,
 # plan mode, compaction, delegation, ask-user, todo, web). Three additions:
 #
 #   1. The persona carries a pipeline protocol built on THREE stage tools —
@@ -40,7 +40,7 @@
 #   2. Tool-surface control: the generic `subagent` / `subagent_fork` tools
 #      are DISABLED — the only dispatch tools are the three stages above.
 #      Kept in the file for provenance, re-enable by removing `disabled: true`.
-#   3. Code Mode presentation (`tool-presentation`, mode: code): the agent's
+#   3. Code Mode presentation (`tool-presentation`, mode: ptc): the agent's
 #      tools — including the stage tools — are presented through the
 #      generated Code Mode SDK, so the model composes multi-step operations in
 #      one TypeScript program executed by `run_code`. Stage subagents compose
@@ -347,4 +347,4 @@
 - id: tool-presentation
   name: '@deepseek-ai/dsh-agent-tool-presentation'
   config:
-    mode: code
+    mode: ptc
