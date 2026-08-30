@@ -121,13 +121,21 @@ Markdown 渲染，长计划会挤压展示）：
 
 运行规则以 `preset/code-pipeline/agent.cordis.yml` 的 pipeline protocol 为准。
 
-## 大字段自动落盘
+## 派发消息整体落盘（单个临时文件）
 
-传给子代理的物料字段（`context` / `plan` / `constraints` / `implementationSummary` /
-`diff` / `focus`）若**超过 100 行**（`config.largeFieldLines` 可调），插件自动将内容写入平台临时目录（`os.tmpdir()/dsh-code-pipeline/`），子代理提示中仅保留
-`<diff (N lines)> written to temp file: <path> — read it with the read tool` 引用，
-由子代理用 `read` 读取——防止长 diff 在派发/模型上下文中被截断。小字段仍内联传入。
-启动时自动清理超过 24 小时的临时文件。
+主代理调用阶段工具时，插件把**完整派发消息**——`prompt`/`task` 与该阶段所有物料字段
+（`context` / `plan` / `constraints` / `implementationSummary` / `diff` / `focus`）合并后的
+**全文**——整体写入**一个临时文件**（`os.tmpdir()/dsh-code-pipeline/` 下，文件名带阶段前缀和
+UUID），子代理提示中仅保留
+`<dispatch message (N lines, M chars)> written to temp file: <path> — read the WHOLE file with the read tool`
+引用。子代理只需 `read` **一次**即可拿到全部消息：不会因长 diff 在派发/模型上下文中被截断，
+也避免了逐字段多文件的读取负担。
+
+- **默认全部落盘**（`config.spillAllFields: true`，设置页可关）；关闭后回退阈值模式：
+  仅当消息超过 `config.largeFieldLines`（默认 100）行时才落盘。
+- review 的 `diff` 硬校验不变：**原始值**必须含 `@@` 块头（完整补丁文本）——校验在落盘
+  之前执行，统计摘要 / “见 git show”引用仍被拒绝。
+- 临时文件在启动时自动清理（超过 24 小时的删除）。
 
 ## 长任务与后台派发
 

@@ -28,7 +28,9 @@
 #      The read-only stages never execute commands. The change set reaches the
 #      reviewer as data: before each review call the main agent captures the
 #      diff (git status/diff when the workspace is a repo, otherwise the impl
-#      change summary) and includes it in the review prompt.
+#      change summary) and includes it in the review prompt. Every dispatch
+#      message (prompt + all stage inputs) is written to ONE temp file and the
+#      child reads it with the read tool — see README «派发消息整体落盘».
 #
 #      The `deepseek-official` route is the built-in DeepSeek adapter; its
 #      route-level reasoning default is set to max via the `llm-deepseek`
@@ -72,7 +74,7 @@
 
       **Never review a change set yourself — `subagent_review` owns every verdict (APPROVED / CHANGES REQUIRED + numbered issues). Never fix review issues yourself — re-dispatch `subagent_impl` with the issue list.** Your own reads of the workspace serve capture and context, not judgment: you assemble the diff for the reviewer, you never issue the verdict.
 
-      **Never hand a reviewer a reference instead of the material** (no "see git show", no stat-only diff): pass the FULL patch text in the dedicated `diff` field — the stage tool auto-spills fields over 100 lines and the review subagent has no shell.
+      **Never hand a reviewer a reference instead of the material** (no "see git show", no stat-only diff): pass the FULL patch text in the dedicated `diff` field — the stage tool spills the whole dispatch message to a single temp file (all fields, spilled regardless of size) and the review subagent has no shell.
 
       Judge complexity before acting. A simple task you handle directly with your own programs — no delegation. **Very short tasks (a few seconds to a minute) are ALWAYS handled directly in the main session — never dispatched to a stage.** A stage is for work that deserves its own focused subagent with its pinned model, persona, and tool surface. Complex work runs through the three stage tools — `subagent_plan`, `subagent_impl`, `subagent_review` — as independent building blocks, in any subset or combination: plan-only, impl-only, review-only (you merge the verdicts), or the full build flow below. Adapt mid-flight when a stage surprises you — within the invariants at the end.
 
@@ -129,7 +131,7 @@
       - Git repo: run `git status --porcelain` for the changed-file list, then `git diff HEAD --stat` and `git diff HEAD` for the change text (covers staged and unstaged work; if the change was committed, use `git show HEAD --stat` + `git show HEAD` instead) — via `await tools.pwsh(...)`.
       - Not a git repo: fall back to the implementation summary plus the exact changed-file list from the impl stage's report, and tell the reviewer explicitly that no diff was available.
 
-      For a parallel review, capture each target's diff separately and pass it to that target's own `subagent_review` call. Put the file list and the diff text into the review prompt. **HARD RULE — pass the FULL raw patch text in the dedicated `diff` field**: never replace it with a stat summary, a file list, or a "see git show / 完整 diff 见…" reference (the review subagent has no shell and cannot run git), and never inline large material into `prompt` (inline generation is truncated at the model output limit). The stage tool rejects a `diff` lacking `@@` hunk headers, and writes fields over 100 lines to a temp file automatically — the child reviews the file path and reads it with the `read` tool, so nothing is truncated. You may still stage material as separate fields (`plan`/`implementationSummary`/`diff`/`focus`) or inline SHORT material in the prompt.
+      For a parallel review, capture each target's diff separately and pass it to that target's own `subagent_review` call. Put the file list and the diff text into the review prompt. **HARD RULE — pass the FULL raw patch text in the dedicated `diff` field**: never replace it with a stat summary, a file list, or a "see git show / 完整 diff 见…" reference (the review subagent has no shell and cannot run git), and never inline large material into `prompt` (inline generation is truncated at the model output limit). The stage tool rejects a `diff` lacking `@@` hunk headers, and writes the WHOLE dispatch message (prompt + all staged fields) to ONE temp file automatically — the child reads that single file with the `read` tool, so nothing is truncated. You may still stage material as separate fields (`plan`/`implementationSummary`/`diff`/`focus`) or inline SHORT material in the prompt.
 
       ### Invariants (never bend)
 
