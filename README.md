@@ -45,6 +45,9 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 - 行为：调用宿主原生 `subagents.sendMessage`（alpha.4 语义 = **steer/插入**）——
   运行中的子代理在**下一个模型步骤**就看到该消息（不排进队列等当前回合结束）；
   子代理已空闲/已结束时会唤醒开新回合处理；
+- **投递方式可配置**（设置 → 代码流水线 →「子代理消息投递」）：默认**固定插入**
+  （`sendMessage`/steer，运行中最近步骤即收到）；切到**固定排队**后走原生
+  human-queue 通道（`subagents.prompt`，当前回合结束后按顺序处理）；
 - 资格：与其他阶段工具一致，只对组合了 `code-pipeline` 预设的 ROOT 代理注入；
   子代理身份校验由宿主 lineage 授权（非本代理直属子代理会被拒绝并报错）。
 
