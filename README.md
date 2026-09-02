@@ -51,6 +51,14 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 - 资格：与其他阶段工具一致，只对组合了 `code-pipeline` 预设的 ROOT 代理注入；
   子代理身份校验由宿主 lineage 授权（非本代理直属子代理会被拒绝并报错）。
 
+## 评审物料不要把 `.diff` 留在工作区
+
+主代理为了把大的变更集从 `subagent_review(diff=…)` 参数里卸下来，可能用
+`Out-File` 把 diff 写到项目根目录（如 `.review_*.diff`）。三个阶段工具的
+description 现已带**物料卫生纪律**：中间文件只允许写在 `.pipeline-tmp/`
+（工作区，内置清理）或 `$env:TEMP\dsh-code-pipeline\`，用毕立即删除；
+严禁在工作区根留下 `.*.diff` 评审物。
+
 > 注意：**子代理自己的输入框**仍会排队（宿主 `subagents.prompt` 硬编码
 > `mode: 'continuable'`，且输入栏对子代理会话关闭了 steering）——这是宿主行为，
 > 插件侧无法改变；改需求请走主对话 → 代理调用 `pipeline_followup`。
