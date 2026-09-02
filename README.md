@@ -33,6 +33,25 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   主代理**不得自己接手任务**（不代做实现/规划/审查、不换路由、不找替身),
   而是告知用户原因并等待决定。
 
+## 中途改需求：pipeline_followup（插入，不排队）
+
+阶段子代理已经派发并开始干活后，用户改了需求 → 主代理用 `send_message` 只能
+靠模型自己找到子代理 id；**`pipeline_followup` 是流水线自己的"插话"工具**：
+
+- 参数 `child`：`latest`（本代理最近派发的阶段子代理）| 阶段键
+  `plan` / `impl` / `review`（含中文别名 规划/计划/实现/评审/审查）| 完整
+  `subagentId`（`session-...`，也支持唯一前缀）；
+- 参数 `message`：要插入的需求变更文本（完整、自包含——子代理没有本对话上下文）；
+- 行为：调用宿主原生 `subagents.sendMessage`（alpha.4 语义 = **steer/插入**）——
+  运行中的子代理在**下一个模型步骤**就看到该消息（不排进队列等当前回合结束）；
+  子代理已空闲/已结束时会唤醒开新回合处理；
+- 资格：与其他阶段工具一致，只对组合了 `code-pipeline` 预设的 ROOT 代理注入；
+  子代理身份校验由宿主 lineage 授权（非本代理直属子代理会被拒绝并报错）。
+
+> 注意：**子代理自己的输入框**仍会排队（宿主 `subagents.prompt` 硬编码
+> `mode: 'continuable'`，且输入栏对子代理会话关闭了 steering）——这是宿主行为，
+> 插件侧无法改变；改需求请走主对话 → 代理调用 `pipeline_followup`。
+
 ## 安装
 
 ### 方式一：一行命令安装（推荐，GitHub 分发）
