@@ -135,7 +135,8 @@ dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
 - 预设中**不得**再包含静态的 `stage-plan` / `stage-impl` / `stage-review` 行
   （由插件注入，避免重名/双重定义）。
 - 其余组成（persona、Code Mode 展示、只读过滤语义、禁用通用
-  `subagent`/`subagent_fork`、delegation 组）保持仓库 `preset/` 副本的样子。
+  `subagent`/`subagent_fork`、禁用 `tool-workflow`、delegation 组）保持仓库
+  `preset/` 副本的样子。
 - 仓库内的 `preset/code-pipeline/` 就是唯一维护源：对预设的任何修改请先改这里，
   再同步拷贝到 `$DSH_HOME\.agent-presets\code-pipeline\`。
 
@@ -213,8 +214,18 @@ UUID），子代理提示中仅保留
 - `dsh-tool-subagent` 的 `execute` 本质是 `ctx.subagents.start('spawn', { ...,
   agentOptions, persona, toolFilter, maxDepth })` —— 模型等是**调用时参数**。
 - `dsh-subagent` 创建子代理时：`composeFrom(childCtx, parent.ctx)` 继承父代理
-  预设；`persona` → 子代理 `deployment:persona` 提示段；`toolFilter` →
+  预设；`persona` → 子代理 `deployment:persona-prefix` 提示段（0.1.3 起该段由
+  `deployment:persona` 拆成 prefix/suffix，见下条）；`toolFilter` →
   `childCtx.tools.restrict(...)`；`agentOptions.provider/model` 优先于父代理路由。
+- **dsh 0.1.3 起的行配置与协议变更（本插件已适配）**：
+  - `@deepseek-ai/dsh-persona` 的配置字段由 `text` 改为 `prefix`（必填）+
+    `suffix`（可选）；旧 `text` 会让该行激活失败，整个预设挂载报
+    `agent-preset/invalid`。预设内用 `prefix`（section 序号与旧 `text` 相同）。
+  - `subagents.prompt`（pipeline_followup 的 queue 通道）的载荷新增必填
+    `delivery: 'queue' | 'steer'`，`mode` 固定 `'continuable'`；插件按
+    「0.1.3+ → alpha.4 → 更早」顺序探测，首个被接受的形状即采用。
+  - 会话格式 v2 把助手流内联进 `assistant/message` / `assistant/attempt` 的
+    `data.stream`（与本插件无直接关系，但会话读取类插件需注意）。
 - 工具注册的层由注册时 ctx 的作用域决定（实测：预设 standing 挂载不向其他
   会话泄漏）；通过 `agent.ctx` 注册落入该代理自身层，代理销毁自动回收。
 - `tools.restrict` 只过滤继承层（global + 祖先），不过滤代理自身层 —— 因此
