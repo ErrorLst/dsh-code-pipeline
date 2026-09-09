@@ -180,8 +180,9 @@ UUID），子代理提示中仅保留
 - **前台模式（仅短任务）**：`run_in_background: false`——等待阶段结果；**注意**
   `run_code` 程序有 20 分钟 wall-clock 上限，超过会截断等待并取消子代理，所以只有
   几分钟内能完成的小任务才用前台；
-- **状态可见**：`list_agents`（running / idle / ready）、`send_message` 继续子代理、
-  `subagent.history` 取完整记录，GUI 子代理视图同步展示；
+- **状态可见**：`list_agents`（running / idle / ready）、`send_message` 继续子代理；
+  完成通知里就带子代理的 outcome 与最终回复（没有独立的 history 工具，
+  所以阶段子代理必须把完整结论写进最终回复），GUI 子代理视图同步展示；
 - 长任务（预计超过当前回合可承受时长）请用后台模式，收到完成通知后再继续下一步。
 
 ## 默认值
@@ -230,3 +231,22 @@ UUID），子代理提示中仅保留
   会话泄漏）；通过 `agent.ctx` 注册落入该代理自身层，代理销毁自动回收。
 - `tools.restrict` 只过滤继承层（global + 祖先），不过滤代理自身层 —— 因此
   阶段工具只注入 ROOT 代理，避免子代理的自有层被其只读过滤豁免。
+
+## 变更记录
+
+- **0.1.10（适配 dsh 0.1.5-alpha.1 + 自身缺陷修复）**：
+  - 宿主 API 全部核对未变（agentPresets / subagents / 四个事件 / 工具注册与输出 schema /
+    settings.installSection / webServer / 预设行与包名），预设与内置 `ptc` 逐行比对无过期项。
+  - 修 `readFileSync` 未导入：预设陈旧自检此前抛 ReferenceError 被 catch 吞掉，
+    永远不会告警（现在已可用）。
+  - 修模型侧指引引用不存在的 SDK 函数 `subagent.history`（PTC SDK 只有扁平的
+    `tools.<工具名>`，宿主没有 history 工具）——改为「完成通知本身就是最终结果」。
+  - 修 `pipeline_followup` 在回执缺 `messageId` 时返回 undefined 属性 →
+    宿主输出校验报 `not lossless JSON`（消息已投递却报错）；现在缺键即省略。
+  - 注入记账由「agent id 集合」改为 `WeakSet<Agent>`：宿主支持同 id 冷恢复，
+    旧的 id 集合会让恢复后的会话拿不到阶段工具。
+  - 设置节 schema 收窄到真正生效的 `stages` + `followupMode`（其余四项是组合配置，
+    写设置页不会生效）；`largeFieldLines` 补进 Config 声明。
+  - 预设 `tool-web.fetch` 与上游 `ptc` 对齐改回 `true`（只读阶段的 `web_fetch`
+    由 toolFilter 拦截，主代理恢复该能力）；输出 schema 去掉重复的 `messageId` 属性；
+    客户端删掉从未使用的 `connection` / `remote` inject。

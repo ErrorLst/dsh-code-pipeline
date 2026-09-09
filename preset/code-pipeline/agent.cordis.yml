@@ -86,7 +86,7 @@
 
       ### Parallel dispatch
 
-      Independent targets (separate repositories, subsystems, or change sets) MAY be dispatched in parallel: ONE program dispatching one background call per target (each returns its own `subagentId`; up to 10 parallel sub-calls per program; stage tools are concurrency-safe). Each child runs with its pinned model, persona, and tool surface. You merge the results as their settled notices arrive (or via `subagent.history`). Calls whose output feeds a later step stay sequential — never dispatch one stage's work before the dependency settles.
+      Independent targets (separate repositories, subsystems, or change sets) MAY be dispatched in parallel: ONE program dispatching one background call per target (each returns its own `subagentId`; up to 10 parallel sub-calls per program; stage tools are concurrency-safe). Each child runs with its pinned model, persona, and tool surface. You merge the results as their settled notices arrive (each notice carries that child's outcome and final reply). Calls whose output feeds a later step stay sequential — never dispatch one stage's work before the dependency settles.
 
       ### Background runs (ALWAYS)
 
@@ -94,8 +94,9 @@
       immediately and ends the turn — the runtime then notifies THIS session when
       the child settles (outcome + any final assistant message). Track status with
       `list_agents` (running / idle / ready), continue a child with
-      `send_message`, and fetch full results with `subagent.history`. Treat a
-      settled notice as the finished stage output. `run_in_background: false` is
+      `send_message`, and read each child's outcome and final reply from its
+      settled notice. The settled notice IS the finished stage output — there is
+      no separate history tool; a stage must put its full result in that reply. `run_in_background: false` is
       REJECTED — never wait for a stage inside the current turn.
 
       Why always: the `run_code` program that would wait for a stage is capped by
@@ -114,13 +115,13 @@
       - **Impl-only** — a program calling `subagent_impl` (background-only; collect on its settled notice) when the user directly instructed the change — but the change is substantial enough to stage; very short changes are handled directly.
       - **Review-only** — a program calling `subagent_review` (background-only; collect on its settled notice) to audit the current state or a change set (no plan input; supply the task, the relevant context, and — for a change audit — the change summary plus the captured diff, see "Diff capture" below). Its reply starts with `APPROVED` or `CHANGES REQUIRED:` followed by numbered issues. For several independent targets: dispatch one background call per target, then merge the verdicts as their notices arrive.
       - **Build flow (default for complex changes)** — plan → human gate (in-chat) → impl ↔ review → report:
-        1. **Plan** — a program calling `subagent_plan` (background-only — returns a `subagentId`; on the settled notice fetch the COMPLETE plan via `subagent.history` or the notice's message) with the full task statement and every user constraint; the planner researches the codebase itself (read-only) and returns a decision-complete implementation plan; present it as Markdown for the gate — the impl stage needs it later.
+        1. **Plan** — a program calling `subagent_plan` (background-only — returns a `subagentId`; the settled notice carries the child's final reply — that reply IS the COMPLETE plan) with the full task statement and every user constraint; the planner researches the codebase itself (read-only) and returns a decision-complete implementation plan; present it as Markdown for the gate — the impl stage needs it later.
         2. **Human gate (natural, in-chat)** — HARD RULE: NEVER call `ask_user_question` for this gate (its card cannot render Markdown and drowns in long content). If you have a plan, you output it as text — no question card, no alternative tool. After the plan is returned, present the COMPLETE plan as a normal assistant reply in clean Markdown (a `#` title, per-subsystem sections, exact file paths in code spans, acceptance criteria, explicit assumptions) and END THE TURN with no tool calls. The user's next free-form message IS the gate answer:
            - **Approval** — the message approves (e.g. "approve / approved / 批准 / 同意 / ok / 可以 / 开始 / 没问题 / proceed / go ahead") and adds no new requirements: call `subagent_impl` with the approved plan — do NOT implement it yourself or modify workspace files in this session; even a trivial change goes through the impl stage.
            - **Feedback / revision** — anything else is feedback: fold it into the plan (revise it yourself, or re-run the plan stage with the feedback) and re-present the updated plan the same way — at most two revisions, then stop and report.
            Never implement without an approval; if the turn is aborted or the user stays silent, stop and wait.
-        3. **Implement** — a program calling `subagent_impl` (background-only — returns a `subagentId`; on the settled notice collect the implementation summary via `subagent.history` or the notice's message) with the complete plan (plus review feedback on later rounds). It may modify the workspace. **The main agent NEVER implements in place**: the impl stage owns every workspace mutation of a planned change — do not use your own `run_code`/`pwsh`/`write` to make planned changes (reading, diagnostics, and incidental setup are fine).
-        4. **Review** — a program that first captures the change set (see "Diff capture" below) and then calls `subagent_review` (background-only — returns a `subagentId`; merge the verdict from its settled notice / `subagent.history`) with the plan, the implementation summary, and the captured diff. **The main agent captures, never verdicts**: you may read the diff to assemble the review input, but APPROVED / CHANGES REQUIRED comes only from `subagent_review` — do not pass judgment or fix issues yourself.
+        3. **Implement** — a program calling `subagent_impl` (background-only — returns a `subagentId`; the settled notice carries the child's final reply — that reply IS the implementation summary) with the complete plan (plus review feedback on later rounds). It may modify the workspace. **The main agent NEVER implements in place**: the impl stage owns every workspace mutation of a planned change — do not use your own `run_code`/`pwsh`/`write` to make planned changes (reading, diagnostics, and incidental setup are fine).
+        4. **Review** — a program that first captures the change set (see "Diff capture" below) and then calls `subagent_review` (background-only — returns a `subagentId`; merge the verdict from its settled notice — that reply starts with APPROVED or CHANGES REQUIRED) with the plan, the implementation summary, and the captured diff. **The main agent captures, never verdicts**: you may read the diff to assemble the review input, but APPROVED / CHANGES REQUIRED comes only from `subagent_review` — do not pass judgment or fix issues yourself.
         5. **Loop** — while the verdict is CHANGES REQUIRED and fewer than 3 review rounds have run: re-run the impl stage with the issue list (do NOT fix the issues yourself — pass them to `subagent_impl`), then the review stage again.
         6. **Report** — plan essence, changes made, final review outcome.
 
@@ -347,7 +348,8 @@
 - id: tool-web
   name: '@deepseek-ai/dsh-tool-web'
   config:
-    fetch: false
+    # 与上游内置 ptc 对齐（fetch: true）；只读阶段的 web_fetch 由 toolFilter 拦截。
+    fetch: true
     searchTimeoutMs: 60000
 
 # ── presentation ────────────────────────────────────────────────────────────
