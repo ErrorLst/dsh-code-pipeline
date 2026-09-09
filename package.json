@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-code-pipeline",
-  "version": "0.1.10",
-  "description": "DSH bundle plugin: 为 code-pipeline 预设（PTC 流水线）动态注入阶段子代理工具（subagent_plan / subagent_impl / subagent_review），各阶段 provider/model/思考等级可在设置页（Settings → 代码流水线）实时配置并持久化到 settings.yaml；预设文件随项目在 preset/ 目录维护，首次启动自动安装到 $DSH_HOME/.agent-presets（见 README）",
+  "version": "0.1.11",
+  "description": "DSH bundle plugin: 为 code-pipeline 预设（PTC 流水线）动态注入阶段子代理工具（subagent_plan / subagent_impl / subagent_review），各阶段 provider/model/思考等级/最大并发数可在设置页（Settings → 代码流水线）实时配置并持久化到 settings.yaml（并发上限按父会话准入控制，运行中可动态调整）；预设文件随项目在 preset/ 目录维护，首次启动自动安装到 $DSH_HOME/.agent-presets（见 README）",
   "homepage": "https://github.com/ErrorLst/dsh-code-pipeline",
   "repository": {
     "type": "git",

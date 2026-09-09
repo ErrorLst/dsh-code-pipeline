@@ -17,8 +17,10 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 - **模型选择（动态）**：每个阶段工具**每次调用时**读取设置命名空间
   `code-pipeline`（`$DSH_HOME/settings.yaml` 的 `code-pipeline` 节），即时生效。
 - **设置页（浏览器）**：Settings → 代码流水线，每阶段配置 `enabled` /
-  `provider` / `model`，provider/模型列表来自
-  `GET /dsh-code-pipeline/options`（不可用时相应字段禁用并提示，不允许手输）。
+  `provider` / `model` / `reasoningEffort` / `maxConcurrency`，provider/模型列表来自
+  `GET /dsh-code-pipeline/options`（不可用时相应字段禁用并提示，不允许手输）；
+  每阶段卡片还显示「当前运行 N / 上限 M」，数据来自
+  `GET /dsh-code-pipeline/status`（每 5 秒轮询）。
 
 ## 角色边界（硬约束）
 
@@ -189,11 +191,11 @@ UUID），子代理提示中仅保留
 
 所有阶段默认统一走 `deepseek-official` / `deepseek-v4-flash`：
 
-| 阶段 | 默认 provider | 默认 model | 角色 |
-| --- | --- | --- | --- |
-| plan | deepseek-official | deepseek-v4-flash | 只读,仅规划 |
-| impl | deepseek-official | deepseek-v4-flash | 全工具面,仅实现 |
-| review | deepseek-official | deepseek-v4-flash | 只读,仅审查 |
+| 阶段 | 默认 provider | 默认 model | 默认并发上限 | 角色 |
+| --- | --- | --- | --- | --- |
+| plan | deepseek-official | deepseek-v4-flash | 0（不限制） | 只读,仅规划 |
+| impl | deepseek-official | deepseek-v4-flash | 0（不限制） | 全工具面,仅实现 |
+| review | deepseek-official | deepseek-v4-flash | 0（不限制） | 只读,仅审查 |
 
 > 无 fallback 孪生工具:阶段 provider/凭据/启动失败时直接报错并报告,不自动换路由。
 
@@ -209,6 +211,35 @@ UUID），子代理提示中仅保留
 `llm-pi-ai` 路由的 `reasoning`)。实现方式:工具派发时给子代理 options 打
 `stageKey` 标记;插件在官方扩展点 `agent/request` waterfall 中,对命中阶段且已
 配置思考等级的子代理注入 `reasoningEffort`;留空则完全不动调用配置。
+
+## 每阶段并发上限与并行派发
+
+- **设置项**：Settings → 代码流水线 → 每个阶段卡片的「最大并发子代理数」。口径是
+  **同一父会话内该阶段同时运行（宿主 `activity = running`）的子代理数**；`0` = 不限制（默认）。
+- **准入判定（两步）**：
+  1. **同步先到先得**：用插件账本（运行中 + 本次启动预留）判定，超限立即拒绝；
+     通过则同步占位。判定必须完全同步——PTC 的 `Promise.all` 会让同一阶段的多个
+     调用同时进入 `execute`，若等 `await` 之后再判定，两个并发调用会互相把对方
+     算进名额而**双双被拒**（开发时实测到这个缺陷，已修）。
+  2. **异步核对**：再用宿主 `subagents.listChildren(parent.id)` 的
+     `activity === "running"` 核对真实运行数（捕获账本不知道的子代理：重启前派发
+     的、被 `pipeline_followup` 唤醒的），偏保守时可以拒绝一个刚准入的调用；同时
+     用结果修剪账本里已 settle 的条目（自愈）。宿主没有 `listChildren` 或查询失败
+     时退回账本，并用 live Agent 的 `status === "idle"` 修剪。
+  超限时工具**拒绝**本次派发，错误信息明确标注「这是瞬时策略拒绝，不是阶段不可用」——
+  主代理应等完成通知后派发剩余目标，或改用 `pipeline_followup` 给运行中的子代理
+  插话，**不得**按 UNAVAILABLE 规则终止任务。
+- **动态修改**：工具每次调用都读设置，所以保存后**下一次派发**立即生效，无需重启。
+  调高立即放开；**调低不会中断正在运行的子代理**，只是在新派发时按新值拦截，直到
+  运行数降到新值以下。设置页每 5 秒轮询 `/dsh-code-pipeline/status` 显示
+  「当前运行 N / 上限 M」。
+- **边界**：宿主每个 `run_code` 程序仍有 `maxParallelSubCalls`（默认 10）的并行
+  子调用上限，所以设 20 也不会在一个程序里真正并行超过 10 个；`ralph` 派发的子
+  代理不经过阶段工具，不受此限；账本是进程内的，dsh 重启后无法从宿主数据恢复旧
+  子代理的阶段身份（它们不再计入）。
+- **预设侧的并行偏好**：`code-pipeline` 预设的 pipeline protocol 要求
+  「独立目标优先在一个程序里并行派发多个阶段子代理以加快进度」，并说明超限拒绝
+  是瞬时的、不是阶段失败。
 
 ## 重要实现事实（与官方 dsh 源码核对）
 
@@ -234,6 +265,20 @@ UUID），子代理提示中仅保留
 
 ## 变更记录
 
+- **0.1.11（每阶段并发上限 + 预设并行派发偏好）**：
+  - 新增设置项 `stages.<stage>.maxConcurrency`（默认 0 = 不限制）：同一父会话内该
+    阶段同时运行的子代理上限。准入两步：**同步先到先得**（账本 + 预留，避免并发
+    调用互相算名额而双双被拒）→ **异步核对**宿主 `subagents.listChildren` 的
+    `activity === "running"` 并修剪账本（覆盖 PTC `Promise.all` 竞态、重启后或
+    被 followup 唤醒的子代理）。超限拒绝并明确标注为瞬时策略拒绝（**不是**阶段
+    不可用，不得终止任务）。已用假 ctx 集成测试覆盖：顺序准入 / 超限拒绝 / settle
+    释放 / 并发竞态（limit=1 恰好 1 成功 1 拒绝）/ limit=0 不限制 / 外部 running
+    拦截 / 状态端点。
+  - 新增只读端点 `GET /dsh-code-pipeline/status`（各阶段 running / pending / limit），
+    设置页每阶段卡片显示「当前运行 N / 上限 M」并每 5 秒轮询。
+  - 预设 pipeline protocol 的 Parallel dispatch 段升级为「优先并行」：独立目标应在
+    一个程序里并行派发多个阶段子代理以加快进度；Invariants 同步更新；三条阶段工具
+    的 description 补充 CONCURRENCY 说明（超限是瞬时的 + 鼓励并行派发）。
 - **0.1.10（适配 dsh 0.1.5-alpha.1 + 自身缺陷修复）**：
   - 宿主 API 全部核对未变（agentPresets / subagents / 四个事件 / 工具注册与输出 schema /
     settings.installSection / webServer / 预设行与包名），预设与内置 `ptc` 逐行比对无过期项。

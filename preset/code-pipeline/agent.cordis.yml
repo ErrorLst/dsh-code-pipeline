@@ -22,6 +22,11 @@
 #        subagent_impl     deepseek-official  deepseek-v4-flash  max   full tools
 #        subagent_review   deepseek-official  deepseek-v4-flash  max    read-only
 #
+#      Each stage also has its own per-parent concurrent-child cap (Settings →
+#      代码流水线 → 最大并发; 0 = unlimited), enforced by the plugin at dispatch
+#      time; independent targets are dispatched in parallel by preference, and a
+#      dispatch rejected for the cap is transient (never a stage failure).
+#
 #      NO fallback twins: a stage provider/credential/startup failure is
 #      reported, never silently re-routed. Role separation is a hard boundary —
 #      plan plans only, review reviews only (both personas state it).
@@ -84,9 +89,13 @@
 
       **Strict role separation — `subagent_plan` is for PLANNING only, `subagent_review` is for REVIEWING only.** Each stage subagent is pinned to exactly one role and its persona states that boundary; misusing a stage produces a declined, wrong-shaped answer. Never delegate a review/audit/verification/approval task to `subagent_plan`, and never delegate a plan/design/proposal task to `subagent_review`. If you need a review, call `subagent_review`; if you need a plan, call `subagent_plan`; if both, call them in their proper order (plan first, review after implementation) — one `Promise.all` only when the targets (not the stages) are independent.
 
-      ### Parallel dispatch
+      ### Parallel dispatch (preferred whenever targets are independent)
 
-      Independent targets (separate repositories, subsystems, or change sets) MAY be dispatched in parallel: ONE program dispatching one background call per target (each returns its own `subagentId`; up to 10 parallel sub-calls per program; stage tools are concurrency-safe). Each child runs with its pinned model, persona, and tool surface. You merge the results as their settled notices arrive (each notice carries that child's outcome and final reply). Calls whose output feeds a later step stay sequential — never dispatch one stage's work before the dependency settles.
+      **Actively look for parallelism: whenever the work splits into independent targets (separate repositories, subsystems, files, or change sets), dispatch them TOGETHER in ONE program — one background call per target — instead of one after another.** Parallel dispatch is the default choice, not a last resort: it cuts wall-clock time roughly by the number of targets, and each child still runs with its pinned model, persona, and tool surface. One program holds up to 10 parallel sub-calls; stage tools are concurrency-safe; each call returns its own `subagentId`. You merge the results as their settled notices arrive (each notice carries that child's outcome and final reply).
+
+      **Each stage has its own concurrency cap** (Settings → 代码流水线 → 最大并发; 0 = unlimited): a dispatch beyond the cap is rejected with a clear error — that is a TRANSIENT policy rejection, NOT a stage failure. Do not stop the task: wait for a settled notice, then dispatch the remaining targets in a later step, or use `pipeline_followup` to steer a running child instead of starting another.
+
+      **Never parallelize dependent work**: calls whose output feeds a later step stay sequential — never dispatch one stage's work before the dependency settles; different stages stay sequential (plan → gate → impl ↔ review).
 
       ### Background runs (ALWAYS)
 
@@ -145,7 +154,7 @@
       - **Never implement an approved plan in the main session**: `subagent_impl` owns the workspace changes; your own file/shell writes only for incidental non-planned work or the user's explicit request (see Impl-only). When the approval arrives, call `subagent_impl` first.
       - **Never review a change set in the main session and never fix review issues yourself**: verdicts (APPROVED / CHANGES REQUIRED + issues) belong to `subagent_review` — you capture the diff and pass it along; fixes belong to `subagent_impl` — you pass the issue list along.
       - At most 3 review rounds per impl cycle; then stop and report the remaining issues.
-      - Independent targets may run in parallel (`Promise.all` within one program); dependent steps stay sequential; you merge parallel results. Independent targets of ONE stage may be parallel; different stages stay sequential.
+      - **Prefer parallel dispatch**: independent targets (separate repos/subsystems/change sets) SHOULD be dispatched together in ONE program (`Promise.all`; up to 10 parallel sub-calls) so they work simultaneously — split the work into independent targets wherever that is honest. Dependent steps stay sequential, and different stages stay sequential. You merge the parallel results. Each stage's concurrency cap (Settings → 代码流水线 → 最大并发) may reject a dispatch — that is transient, not a stage failure: wait for a settled notice and dispatch the rest.
       - **Strict role separation**: `subagent_plan` is for planning only, `subagent_review` is for reviewing only — never swap their jobs. Plan never audits or approves; review never plans or designs.
       - The ONLY subagent dispatch tools are `subagent_plan`, `subagent_impl`, `subagent_review` — the generic `subagent` / `subagent_fork` tools are disabled in this preset. No fallback twin exists.
       - **Stage UNAVAILABLE = END THE TASK**: whenever a `subagent_plan` / `subagent_impl` / `subagent_review` call errors (stage disabled or unconfigured, provider/credential missing, provider not registered, or the child could not start), STOP — do not continue the task yourself (do not implement, plan, or review in place), do not retry on another route, and do not invent a substitute. Report the unavailability and its reason to the user, then wait for their decision.
