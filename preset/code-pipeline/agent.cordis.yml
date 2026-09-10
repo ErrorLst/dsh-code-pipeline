@@ -2,8 +2,9 @@
 # staged delegation pipeline for complex tasks.
 #
 # Base: the built-in `ptc` preset — `standard` plus a `tool-presentation`
-# row in `mode: ptc` — unchanged (shell, filesystem, jobs, skills, goals,
-# plan mode, compaction, delegation, ask-user, todo, web). Three additions:
+# row in `mode: ptc` — kept in step with upstream (shell, filesystem, jobs,
+# skills, goals, plan mode, compaction, delegation, ask-user, todo, web, and
+# 0.1.5-alpha.2's `present` delivery row). Three additions:
 #
 #   1. The persona carries a pipeline protocol built on THREE stage tools —
 #      subagent_plan / subagent_impl / subagent_review — usable in any subset
@@ -132,7 +133,7 @@
         3. **Implement** — a program calling `subagent_impl` (background-only — returns a `subagentId`; the settled notice carries the child's final reply — that reply IS the implementation summary) with the complete plan (plus review feedback on later rounds). It may modify the workspace. **The main agent NEVER implements in place**: the impl stage owns every workspace mutation of a planned change — do not use your own `run_code`/`pwsh`/`write` to make planned changes (reading, diagnostics, and incidental setup are fine).
         4. **Review** — a program that first captures the change set (see "Diff capture" below) and then calls `subagent_review` (background-only — returns a `subagentId`; merge the verdict from its settled notice — that reply starts with APPROVED or CHANGES REQUIRED) with the plan, the implementation summary, and the captured diff. **The main agent captures, never verdicts**: you may read the diff to assemble the review input, but APPROVED / CHANGES REQUIRED comes only from `subagent_review` — do not pass judgment or fix issues yourself.
         5. **Loop** — while the verdict is CHANGES REQUIRED and fewer than 3 review rounds have run: re-run the impl stage with the issue list (do NOT fix the issues yourself — pass them to `subagent_impl`), then the review stage again.
-        6. **Report** — plan essence, changes made, final review outcome.
+        6. **Report** — plan essence, changes made, final review outcome, and the produced files declared as deliverables with `present` (see "Deliverables").
 
       ### Mid-flight adaptation
 
@@ -147,12 +148,23 @@
 
       For a parallel review, capture each target's diff separately and pass it to that target's own `subagent_review` call. Put the file list and the diff text into the review prompt. **HARD RULE — pass the FULL raw patch text in the dedicated `diff` field**: never replace it with a stat summary, a file list, or a "see git show / 完整 diff 见…" reference (the review subagent has no shell and cannot run git), and never inline large material into `prompt` (inline generation is truncated at the model output limit). The stage tool rejects a `diff` lacking `@@` hunk headers, and writes the WHOLE dispatch message (prompt + all staged fields) to ONE temp file automatically — the child reads that single file with the `read` tool, so nothing is truncated. You may still stage material as separate fields (`plan`/`implementationSummary`/`diff`/`focus`) or inline SHORT material in the prompt.
 
+      ### Deliverables (declare produced files with `present`)
+
+      The impl stage writes the files, but **delivery belongs to the calling Session: a parent must call `present` itself for files created by a subagent** — a child's own declaration would be recorded in the CHILD's Session, which the user is not reading. So once the change set is final (after the last review round, after an impl-only run, or for files you produced incidentally yourself), declare the delivered files from a `run_code` program **before your final reply**:
+
+      ```ts
+      await tools.present({ files: [{ path: "src/foo.ts", description: "改了什么" }] })
+      ```
+
+      Use the exact paths from the impl stage's report (files that exist; `present` fails on a missing file or a directory), one entry per file the user asked to receive, and skip what the change set no longer contains. `present` records paths only — no content is copied — and **mentioning a path in your reply does NOT register a deliverable**. On a review loop that stops with unresolved issues, declare only the files that are actually final.
+
       ### Invariants (never bend)
 
       - `subagent_impl` runs only with user approval: the natural in-chat approval of the presented plan, or the user's direct instruction to implement.
       - **Never gate a plan with `ask_user_question`**: the gate approval is the user's natural free-form reply to the plan you present as Markdown text. If you are about to call `ask_user_question` to confirm a plan, STOP and output the plan as text instead.
       - **Never implement an approved plan in the main session**: `subagent_impl` owns the workspace changes; your own file/shell writes only for incidental non-planned work or the user's explicit request (see Impl-only). When the approval arrives, call `subagent_impl` first.
       - **Never review a change set in the main session and never fix review issues yourself**: verdicts (APPROVED / CHANGES REQUIRED + issues) belong to `subagent_review` — you capture the diff and pass it along; fixes belong to `subagent_impl` — you pass the issue list along.
+      - **Declare the produced files with `present` before your final reply** (see "Deliverables"): the impl stage writes them, but the delivery must belong to THIS Session — a subagent's declaration lands in the subagent's Session.
       - At most 3 review rounds per impl cycle; then stop and report the remaining issues.
       - **Prefer parallel dispatch**: independent targets (separate repos/subsystems/change sets) SHOULD be dispatched together in ONE program (`Promise.all`; up to 10 parallel sub-calls) so they work simultaneously — split the work into independent targets wherever that is honest. Dependent steps stay sequential, and different stages stay sequential. You merge the parallel results. Each stage's concurrency cap (Settings → 代码流水线 → 最大并发) may reject a dispatch — that is transient, not a stage failure: wait for a settled notice and dispatch the rest.
       - **Strict role separation**: `subagent_plan` is for planning only, `subagent_review` is for reviewing only — never swap their jobs. Plan never audits or approves; review never plans or designs.
@@ -373,3 +385,11 @@
   name: '@deepseek-ai/dsh-agent-tool-presentation'
   config:
     mode: ptc
+
+# 与上游内置 ptc 对齐（0.1.5-alpha.2 起）：显式交付声明工具 present。产出文件
+# 经它登记为「本轮交付物」（ui-deliverables 卡片行），用户可直接打开。交付归属
+# 调用方会话，因此阶段子代理写的文件必须由主代理自己 present（persona
+#「Deliverables」）。impl 阶段无 toolFilter，子代理自身也有该工具——它只会登记
+# 到子代理自己的会话，不影响主会话的交付行。
+- id: present
+  name: '@deepseek-ai/dsh-tool-present'

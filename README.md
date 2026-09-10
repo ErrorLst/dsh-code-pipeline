@@ -139,6 +139,10 @@ dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
 - 其余组成（persona、Code Mode 展示、只读过滤语义、禁用通用
   `subagent`/`subagent_fork`、禁用 `tool-workflow`、delegation 组）保持仓库
   `preset/` 副本的样子。
+- 与上游内置 `ptc` 同步的宿主行**不要删**：例如 0.1.5-alpha.2 起新增的
+  `- id: present`（`@deepseek-ai/dsh-tool-present`）——阶段子代理写的文件要靠
+  它由主代理登记为「本轮交付物」；删掉后模型侧再无交付声明工具（persona 里的
+  交付要求会指向一个不存在的工具）。
 - 仓库内的 `preset/code-pipeline/` 就是唯一维护源：对预设的任何修改请先改这里，
   再同步拷贝到 `$DSH_HOME\.agent-presets\code-pipeline\`。
 
@@ -265,6 +269,26 @@ UUID），子代理提示中仅保留
 
 ## 变更记录
 
+- **0.1.12（适配 dsh 0.1.5-alpha.2：预设补 `present` 交付声明工具）**：
+  - 逐包核对 alpha.2 对插件依赖面的改动：客户端 bundle 契约（`__ModuleLoader__` /
+    `dsh.client` 扫描 / `ui-slots` 的 register + inject 语义）、所用三个槽位
+    （`shell.overlay` / `settings.section` / `conversation.composer.dock`，前两者
+    语义未变，第三个仍是 list 槽 order 0 为内置 stats）、所用 CSS 变量与 DOM 锚点
+    （`--dsh-chat-content-width`、`--dsh-composer-side-clearance`、
+    `--dsh-scrollbar-thumb{,-hover}`、`data-conversation-scroll`、`data-chat-flow`、
+    `data-sidebar-collapsed`、`data-rightbar-fullscreen`）、宿主服务
+    （`agentPresets` / `subagents.listChildren` / `settings` / `webServer`）均未变；
+    alpha.2 删除的 `ui-primitives.DocumentFileIcon` 与 `resources.reload` 本插件未使用。
+  - 顺带记录 alpha.2 的两处相关变化（不影响本插件）：中心栏槽位 `conversation` 更名为
+    `main` / `main.conversation`（本插件不注册中心栏）；新增会话事件
+    `deliverables/presented`、`subagent/catalog`（事件折叠按正向类型匹配，未知类型安全忽略）；
+    `subagents.listChildren` 内部改走新的 `subagentCatalog` 投影（签名与返回类型不变，
+    本插件的并发准入核对因此更快）。
+  - 预设补上上游 `ptc` 在 alpha.2 新增的 `- id: present`（`@deepseek-ai/dsh-tool-present`）：
+    产出文件登记为「本轮交付物」（ui-deliverables 卡片行，可预览或在宿主默认应用中打开）。
+  - persona 新增 `### Deliverables` 段与一条 Invariant，Report 步骤同步要求交付声明：
+    交付归属**调用方会话**——阶段子代理写的文件必须由主代理自己 `present`
+    （子代理自行声明只会登记到子代理会话，主会话看不到）。
 - **0.1.11（每阶段并发上限 + 预设并行派发偏好）**：
   - 新增设置项 `stages.<stage>.maxConcurrency`（默认 0 = 不限制）：同一父会话内该
     阶段同时运行的子代理上限。准入两步：**同步先到先得**（账本 + 预留，避免并发
