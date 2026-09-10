@@ -17,11 +17,12 @@
 #      tools (see the delegation group below) into every code-pipeline agent at
 #      creation and reads each stage's provider/model from the settings namespace
 #      `code-pipeline` (Settings → 代码流水线). The defaults, unchanged
-#      (all stages on the built-in DeepSeek route, v4-flash):
+#      (all stages on the built-in DeepSeek route, the host's default model —
+#      `deepseek-flash`, DeepSeek-V41-Flash since dsh 0.1.5-rc.1):
 
-#        subagent_plan     deepseek-official  deepseek-v4-flash  max    read-only
-#        subagent_impl     deepseek-official  deepseek-v4-flash  max   full tools
-#        subagent_review   deepseek-official  deepseek-v4-flash  max    read-only
+#        subagent_plan     deepseek-official  deepseek-flash  max    read-only
+#        subagent_impl     deepseek-official  deepseek-flash  max   full tools
+#        subagent_review   deepseek-official  deepseek-flash  max    read-only
 #
 #      Each stage also has its own per-parent concurrent-child cap (Settings →
 #      代码流水线 → 最大并发; 0 = unlimited), enforced by the plugin at dispatch

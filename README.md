@@ -193,13 +193,19 @@ UUID），子代理提示中仅保留
 
 ## 默认值
 
-所有阶段默认统一走 `deepseek-official` / `deepseek-v4-flash`：
+所有阶段默认统一走 `deepseek-official` / `deepseek-flash`（= DeepSeek-V41-Flash，
+dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
+`deepseek-v4-flash` 仍在默认目录中，但已不是默认，且宿主目录可被
+`settings.yaml` 的 `llm-deepseek.models` 收窄——插件默认值必须留在默认目录内）：
 
 | 阶段 | 默认 provider | 默认 model | 默认并发上限 | 角色 |
 | --- | --- | --- | --- | --- |
-| plan | deepseek-official | deepseek-v4-flash | 0（不限制） | 只读,仅规划 |
-| impl | deepseek-official | deepseek-v4-flash | 0（不限制） | 全工具面,仅实现 |
-| review | deepseek-official | deepseek-v4-flash | 0（不限制） | 只读,仅审查 |
+| plan | deepseek-official | deepseek-flash | 0（不限制） | 只读,仅规划 |
+| impl | deepseek-official | deepseek-flash | 0（不限制） | 全工具面,仅实现 |
+| review | deepseek-official | deepseek-flash | 0（不限制） | 只读,仅审查 |
+
+> 已保存过阶段配置的会话不受影响：`settings.yaml` 的 `code-pipeline.stages` 里显式
+> 写下的 provider/model 始终优先于这里的默认值。
 
 > 无 fallback 孪生工具:阶段 provider/凭据/启动失败时直接报错并报告,不自动换路由。
 
@@ -268,6 +274,30 @@ UUID），子代理提示中仅保留
   阶段工具只注入 ROOT 代理，避免子代理的自有层被其只读过滤豁免。
 
 ## 变更记录
+
+- **0.1.13（对齐 dsh 0.1.5-rc.1：阶段默认模型跟进宿主新默认 `deepseek-flash`）**：
+  - rc.1 逐包核对结论：插件依赖面**零破坏**——客户端 bundle 契约
+    （`dsh.client` 扫描 / `__ModuleLoader__.load`）、`ui-slots` 的 register+inject
+    语义、本插件所用的槽位（`settings.section`；`shell.overlay` 本插件未用）、
+    `--dsh-*` 设计令牌（alpha.2 与 rc.1 各 42 个，逐一比对无增删）、宿主服务
+    （`agentPresets` / `subagents.listChildren` / `settings` / `webServer` /
+    `llm` / `agents` / `tools`）全部未变；预设行的上游集合也未变
+    （0.1.5-alpha.2 补的 `present` 行仍是当前上游形态）。
+  - rc.1 的源码改动集中在 `ui-sidebar-documentpreview`（新增 renderer 可选
+    `scrollportRef`、`data-code-block-content` 滚动视口）、`ui-sidebar-right` 引导页
+    （tab 类型新增可选 `description`）、`ui-chat` 统计胶囊（`cacheWriteTokens` 为 0 时
+    省略该行）与 `CodeBlock`（新增可选 `contentRef`）——全部是本插件未注册/未使用的
+    内部实现，无需跟随。
+  - **唯一需要跟进的是宿主默认模型**：rc.1 在 `packages/bundle/base/cordis.patch.yml`
+    把 `agent-default-model` 从 `deepseek-v4-flash` 改为 `deepseek-flash`
+    （DeepSeek-V41-Flash；`llm-deepseek` 目录同步新增该条目并保留 V4 三款）。
+    插件三阶段默认值同步改为 `deepseek-official` / `deepseek-flash`：
+    `lib/index.js` 的 `DEFAULT_STAGES`、`lib/client.js` 的卡片兜底值与三段提示文案、
+    预设头部注释、README「默认值」表。
+  - 为什么这是修复而不只是跟随：宿主目录可被 `settings.yaml` 的
+    `llm-deepseek.models` 收窄（例如只列 `deepseek-flash`），此时**未配置**的阶段若仍按
+    旧默认 `deepseek-v4-flash` 派发，会在模型解析阶段直接失败；已显式配置过的阶段
+    （`code-pipeline.stages` 里写死的 provider/model）不受影响。
 
 - **0.1.12（适配 dsh 0.1.5-alpha.2：预设补 `present` 交付声明工具）**：
   - 逐包核对 alpha.2 对插件依赖面的改动：客户端 bundle 契约（`__ModuleLoader__` /
