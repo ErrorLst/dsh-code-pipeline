@@ -52,7 +52,38 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   human-queue 通道（`subagents.prompt`，当前回合结束后按顺序处理）；
 - 资格：与其他阶段工具一致，只对组合了 `code-pipeline` 预设的 ROOT 代理注入；
   子代理身份校验由宿主 lineage 授权（非本代理直属子代理会被拒绝并报错）。
+- **它同时是多轮评审复用的通道**：评审第 2 轮起用 `pipeline_followup` 续用同一个评审
+  子代理（见下节「多轮评审复用」）——同一个投递通道，`child` 传该评审子代理的 `subagentId`。
 
+## 多轮评审复用（prompt 协议：续用同一个评审子代理）
+
+多轮评审（plan → impl ↔ review 里的 review 轮次）不再每轮新开一个评审子代理：**第一轮
+之后的所有轮次通过已有的 `pipeline_followup` 续用第一轮那个评审子代理**。这是**纯 prompt
+约定**（写在 `preset/code-pipeline/agent.cordis.yml` 的 persona 里），不改插件、不加工具
+参数、不加设置项。
+
+- **为什么**：子代理从空会话起步——每轮新开 `subagent_review` 都要重新吃一遍「计划 +
+  完整 diff + 历史结论」，而且新会话没有前缀缓存可命中；续用同一个子代理时，这些都在它的
+  会话里（前缀命中缓存），新一轮只需投递增量物料。
+- **怎么做**（persona 的硬性协议，见预设「Repeat review rounds reuse the SAME reviewer」）：
+  1. 第 1 轮照常 `subagent_review`（计划 + 实现摘要 + 完整 diff），并**记住它返回的
+     `subagentId`** —— 那个子代理就是本任务的评审者（写进 `todo_write` 流程，防上下文压缩丢失）；
+  2. 第 2 轮起改用 `pipeline_followup`：`child` 传该 `subagentId`（本会话只有一个评审子代理时
+     可用 `child: "review"`），`message` 里写清「这是第几轮 + **完整的新 diff** + 每条编号问题的
+     处理说明 + 回复契约（`APPROVED` / `CHANGES REQUIRED:` + 编号问题）」；**计划与历轮 diff
+     不要再传**（评审子代理自己还留着，重复传正是复用要省掉的开销）；
+  3. 结论仍以「完成通知」形式回到本会话，与首轮完全一致——主代理侧流程不变。
+- **边界**：
+  - 该评审子代理还在跑（结论未到）时**不要**续发新回合——先等完成通知（与"不要重复派发
+    进行中的阶段"同一条规则）；
+  - **新任务用新的 `subagent_review`**，绝不复用别的任务的评审子代理；
+  - 多个独立目标并行评审时，每个目标一个评审子代理，按各自的 `subagentId` 续用；
+  - `pipeline_followup` 报「没有匹配的阶段子代理」时（例如 dsh 重启后插件进程内的派发台账
+    被清空），退回一次带完整物料（含计划）的 `subagent_review` 即可——这是**回退**，不是
+    「阶段不可用」，不要因此终止任务；
+  - 宿主侧依据：`pipeline_followup` 走 `subagents.sendMessage`，空闲/已 settle 的子代理会被
+    唤醒成新一轮（宿主 `steer` 语义：idle driver starts a turn；`queue` 模式同理排一个新回合），
+    且再次 settle 时父会话照常收到完成通知。
 ## 评审物料**只允许写系统临时目录**（`$env:TEMP`）
 
 主代理为了把大的变更集从 `subagent_review(diff=…)` 参数里卸下来，可能用
@@ -272,9 +303,30 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   会话泄漏）；通过 `agent.ctx` 注册落入该代理自身层，代理销毁自动回收。
 - `tools.restrict` 只过滤继承层（global + 祖先），不过滤代理自身层 —— 因此
   阶段工具只注入 ROOT 代理，避免子代理的自有层被其只读过滤豁免。
+- **prompt 层的评审复用依赖的宿主语义（0.1.5-rc.1 源码核对）**：`pipeline_followup` 走
+  `subagents.sendMessage(sender, childId, content, { signal })` → `deliverToChild`：子代理仍
+  驻留则 steer 到最近步骤（`steer`：空闲的 driver 会开一个新回合），不驻留则 `coldResume`
+  按 `subagent/descriptor`（provider/model/persona/toolFilter）重建会话，且
+  `activation.announced = true` 保证再次 settle 时父会话仍收到完成通知 —— 所以「续用同一个
+  评审子代理」在现有工具下即可成立，无需新增任何工具或参数。
 
 ## 变更记录
 
+- **0.1.14（prompt 协议：多轮评审复用同一个评审子代理，零代码改动）**：
+  - **问题**：plan → impl ↔ review 循环里每轮评审都是一次新的 `subagent_review` 派发 ——
+    每个新子代理都从空会话起步，重新吃一遍「计划 + 完整 diff + 历史结论」（新会话还没有前缀
+    缓存可命中），又慢又费 token。
+  - **做法（纯 persona/prompt）**：预设 persona 新增「Repeat review rounds reuse the SAME
+    reviewer」硬性协议 —— 第 1 轮照常 `subagent_review` 并记住其 `subagentId`；第 2 轮起改用
+    已有的 `pipeline_followup` 把增量消息（完整新 diff + 每条编号问题的处理说明）投回**同一个**
+    评审子代理，计划与历轮 diff 不再重复传送；结论仍以完成通知回到本会话，评审的回复契约
+    （`APPROVED` / `CHANGES REQUIRED:` + 编号问题）不变。build flow 第 4/5 步、Review-only
+    流程与 Invariants 同步更新；预设头部注释、`preset.yml` 描述同步。
+  - **不改任何代码**：`lib/index.js`、`lib/client.js`、工具参数与输出 schema、设置项、
+    `GET /dsh-code-pipeline/status` 全部与 0.1.13 一致（本次改动只落在 `preset/`）。
+  - 已知边界（persona 里写明）：评审子代理在跑时不续发（先等完成通知）；新任务新派发；
+    并行目标各自按 `subagentId` 续用；`pipeline_followup` 找不到子代理（如 dsh 重启后台账
+    清空）时退回一次带完整物料的 `subagent_review` —— 是回退，不是「阶段不可用」。
 - **0.1.13（对齐 dsh 0.1.5-rc.1：阶段默认模型跟进宿主新默认 `deepseek-flash`）**：
   - rc.1 逐包核对结论：插件依赖面**零破坏**——客户端 bundle 契约
     （`dsh.client` 扫描 / `__ModuleLoader__.load`）、`ui-slots` 的 register+inject
