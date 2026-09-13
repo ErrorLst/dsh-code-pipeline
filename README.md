@@ -91,7 +91,7 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 三个阶段工具的 description 现带**绝对物料卫生纪律**：工作区任何位置
 （根目录 / 子目录 / `.pipeline-tmp/`）都**不允许**创建任何物料/中间文件
 （`*.diff`、`.review_*`、变更集文件等）；确需落盘时**只允许**写入
-`$env:TEMP\dsh-code-pipeline\`，且必须在本次调用返回前删除。
+`$env:TEMP\dsh-code-pipeline`，且必须在本次调用返回前删除。
 
 > 注意：**子代理自己的输入框**仍会排队（宿主 `subagents.prompt` 硬编码
 > `mode: 'continuable'`，且输入栏对子代理会话关闭了 steering）——这是宿主行为，
@@ -152,7 +152,7 @@ dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
   （`$env:DSH_HOME` 默认 `C:\Users\<user>\.dsh`。）
 
 - **升级同步**：插件升级后若行为对不上（工具名/规则文本变化），用仓库新版本
-  **整目录覆盖** `$DSH_HOME\.agent-presets\code-pipeline\`（`Copy-Item -Recurse -Force`）；
+  **整目录覆盖** `$DSH_HOME\.agent-presets\code-pipeline`（`Copy-Item -Recurse -Force`）；
   `diff -r` 两份目录即可先确认差异。
 
 - 生效时机：**新会话/新子代理**生效（dsh 的 standing 挂载按组合文件的变化时间戳
@@ -160,7 +160,7 @@ dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
 
 - 插件与预设的版本对应：插件只保证与**仓库内 preset/ 副本**一致的那一版预设协同
   工作。升级插件后若发现行为对不上（如工具名、规则文本变化），优先检查
-  `$DSH_HOME\.agent-presets\code-pipeline\` 是否落后于仓库的 `preset/code-pipeline\`——
+  `$DSH_HOME\.agent-presets\code-pipeline` 是否落后于仓库的 `preset/code-pipeline`——
   `diff -r` 两份目录即可确认。插件启动时若发现目标预设目录缺失，会自动安装（见上）。
 
 ## 预设要求
@@ -175,7 +175,7 @@ dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
   它由主代理登记为「本轮交付物」；删掉后模型侧再无交付声明工具（persona 里的
   交付要求会指向一个不存在的工具）。
 - 仓库内的 `preset/code-pipeline/` 就是唯一维护源：对预设的任何修改请先改这里，
-  再同步拷贝到 `$DSH_HOME\.agent-presets\code-pipeline\`。
+  再同步拷贝到 `$DSH_HOME\.agent-presets\code-pipeline`。
 
 ## 人工闸门（plan 之后）
 
@@ -282,6 +282,35 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   「独立目标优先在一个程序里并行派发多个阶段子代理以加快进度」，并说明超限拒绝
   是瞬时的、不是阶段失败。
 
+## 每阶段墙钟预算（超时自动中断 + 收尾报告）
+
+- **设置项**：Settings → 代码流水线 → 每个阶段卡片的「墙钟预算（分钟）」；`0` = 不限制（默认）。
+  口径是**该阶段单次派发的最长运行时间**，不做跨派发累计。
+- **为什么需要**：宿主对子代理没有回合 / 步数 / 时长上限（agent-loop 的 Config 只有
+  `maxParallelToolCalls`；`dsh-tool-call-timeout-policy` 只管单次工具调用），一个跑飞的 impl
+  只能由模型自己决定停下，于是长时间烧 token、工作区停在半成品。
+- **超时后插件做什么**（15 秒一轮巡检账本）：
+  1. **中断**：`subagents.interrupt(childId, { kind: "ancestor", agent: parent })` —— 只结束
+     **当前回合**；Activation、未领取的 inbox、已发布的下级都保留，所以之后仍可用
+     `pipeline_followup` 把剩下的活儿交回**同一个**子代理（前缀还在，命中缓存）。
+  2. **索取收尾报告**：等它真正停下（有界轮询 ≤ 15 秒）后，经 host-protocol 的
+     `delivery: "queue"` 通道排队投递一条自包含指令，要求只输出文本：已完成（含精确文件路径）/
+     每处改动的状态（完整 · 半成品）/ 未完成项 / 风险与未验证项 / 建议（续跑 · 拆分 · 回退）。
+     父代理收到的完成通知因此带一份可用现状，而不是只有 `left no closing message`。
+  3. **收尾回合也有宽限**（3 分钟）：再超时就第二次中断 —— 硬停，不再收尾（防止“收尾又跑飞”）。
+- **对主代理的语义**：预算到点是「被中断 + 收尾」，**不是**阶段不可用 —— 三条阶段工具的
+  description 已写明：收到 `was stopped before it finished` 的完成通知后，先等收尾报告通知，
+  再决定「用 `pipeline_followup` 续跑同一个子代理 / 把剩余工作拆小重新派发 / 停下来报告用户」。
+- **边界**：
+  - 预算在**派发时**读入账本：调低不会中断已派发的子代理，只对之后的派发生效（与并发上限同语义）。
+  - 中断是**协作式**的：子代理正卡在长工具调用里时要等它观察到取消信号，实际停止可能有延迟。
+  - 父会话已销毁、宿主缺 `subagents.interrupt`、或授权失败时，账本标记 `lost` 并只告警，不重试。
+  - 账本是**进程内**的：若 `subagent/end` 事件丢失（账本仍认为在跑），看门狗对已结束的子代理
+    最多做一次 no-op 中断 + 一次收尾唤醒，随后相位推进（wrapup → 宽限 → stopped），不会反复唤醒。
+  - 收尾回合会重新计入该阶段并发数（宿主 `activity = running`），并受 3 分钟宽限约束。
+  - `GET /dsh-code-pipeline/status` 每阶段新增 `budgetMinutes` / `timedOut` /
+    `longestRunningMs`；设置卡片显示「墙钟预算 N 分钟；最早已运行 M 分钟；K 个已超时（中断 / 收尾中）」。
+
 ## 重要实现事实（与官方 dsh 源码核对）
 
 - `dsh-tool-subagent` 的 `execute` 本质是 `ctx.subagents.start('spawn', { ...,
@@ -310,8 +339,43 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   `activation.announced = true` 保证再次 settle 时父会话仍收到完成通知 —— 所以「续用同一个
   评审子代理」在现有工具下即可成立，无需新增任何工具或参数。
 
+## 本地验证（冒烟脚本）
+
+仓库不带测试框架，只有一个人可读的假 ctx 冒烟脚本（零测试依赖，直接跑）：
+
+```bash
+pnpm install          # 或 npm install：只为解析 @deepseek-ai/schemastery
+node test/watchdog.smoke.mjs   # 等同于 npm test
+```
+
+`test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 15 项断言：阶段工具与 `pipeline_followup`
+注册、阶段工具 description 带 WALL-CLOCK BUDGET、预算 0 不误伤、预算到点中断一次
+（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"` 投递、收尾宽限用尽第二次中断
+（硬停）、自行 settle 的子代理不被中断、宿主缺 `interrupt` / 父代理缺失时只告警、以及
+`GET /dsh-code-pipeline/status` 的 `budgetMinutes` / `timedOut` / `longestRunningMs` 字段。
+
 ## 变更记录
 
+- **0.1.15（每阶段墙钟预算：超时自动中断 + 自动索取收尾报告）**：
+  - **问题**：宿主对子代理没有回合 / 步数 / 时长上限（agent-loop 的 Config 只有
+    `maxParallelToolCalls`；`dsh-tool-call-timeout-policy` 只管单次工具调用），一个跑飞的 impl
+    只能由模型自己决定停下 —— 长时间烧 token、工作区停在半成品，而父代理只收到一句
+    `was stopped before it finished` / `left no closing message`。
+  - **新增设置项** `stages.<stage>.budgetMinutes`（plan / impl / review 各自独立，默认 0 = 不限制）：
+    该阶段**单次派发**的墙钟预算，派发时快照进账本（与并发上限同语义：只影响后续派发）。
+  - **超时处理（看门狗 15 秒一轮巡检账本）**：① `subagents.interrupt(childId,
+    { kind: "ancestor", agent: parent })` 中断当前回合（只结束 turn，Activation / 未领取 inbox /
+    下级都保留，之后仍可 `pipeline_followup` 续跑同一个子代理）；② 等它停下后经 host-protocol
+    `delivery: "queue"` 投递自包含的收尾报告指令（已完成含精确路径 / 半成品 / 未完成 / 风险 / 建议）；
+    ③ 收尾回合 3 分钟宽限，再超时第二次中断硬停。状态机：running → timed-out → wrapup →
+    wrapup-done，自行结束为 settled，异常路径 stopped / lost。
+  - **模型可见语义**：三条阶段工具 description 增加 WALL-CLOCK BUDGET 段 ——
+    `was stopped before it finished` 不是阶段不可用，等收尾报告通知后决定续跑 / 拆分 / 停止。
+  - `GET /dsh-code-pipeline/status` 每阶段新增 `budgetMinutes` / `timedOut` / `longestRunningMs`；
+    设置卡片新增「墙钟预算（分钟）」输入与实时状态行（预算 / 最早已运行 / 已超时数）。
+  - 假 ctx 集成冒烟（本轮新增，见下）：预算到点触发中断 + queue 收尾投递、子代理自行 settle
+    不误伤、收尾宽限用尽第二次中断、父代理缺失 / 宿主缺 `interrupt` 时不重试、status 端点字段。
 - **0.1.14（prompt 协议：多轮评审复用同一个评审子代理，零代码改动）**：
   - **问题**：plan → impl ↔ review 循环里每轮评审都是一次新的 `subagent_review` 派发 ——
     每个新子代理都从空会话起步，重新吃一遍「计划 + 完整 diff + 历史结论」（新会话还没有前缀
