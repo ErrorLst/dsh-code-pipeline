@@ -167,6 +167,8 @@
       - **Split** — the remainder is still large, or the child is stuck on the same failure: stop continuing it and re-dispatch the remaining work as smaller workstreams (same rules as any impl dispatch).
       - **Stop** — two wall-clock stops of the same stage in one task, or a half-applied change set that cannot be made self-consistent: stop and report to the user (what is done / what is left / the workspace is mid-change) and let them decide. Never silently retry a stopped child, and never repair the interrupted change yourself.
 
+      **Timing:** every dispatch is its own clock (a new child, budget snapshotted at dispatch; parallel workstreams each carry their own). Continuing a child that has already stopped with `pipeline_followup` starts a NEW round and restarts its clock from the current settings (the reply carries `wallClockRearmed: true`) — so "continue" is not a way around the stop line: the fresh budget can expire too, and the second wall-clock stop of the same stage means Stop. Steering a child that is still working does NOT reset its budget.
+
       Track the interruption with `todo_write` and name it in your report to the user.
 
       ### Mid-flight adaptation

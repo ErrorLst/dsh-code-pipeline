@@ -302,6 +302,8 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
 - **对主代理的语义**：预算到点是「被中断 + 收尾」，**不是**阶段不可用 —— 三条阶段工具的
   description 已写明：收到 `was stopped before it finished` 的完成通知后，先等收尾报告通知，
   再决定「用 `pipeline_followup` 续跑同一个子代理 / 把剩余工作拆小重新派发 / 停下来报告用户」。
+- **计时口径（每次派发各自独立）**：每个阶段工具调用都创建一个**新的子代理**，各自从派发时刻独立计时、互不影响（并行的多个 workstream 也是各算各的）；预算在派发时快照，改设置只影响之后的派发。
+  同一个子代理被 `pipeline_followup` **续跑**时：目标**已停下**（settled / 收尾回合结束 / 已硬停）→ 重新起算墙钟，并按**当时设置**取新预算（工具回执带 `wallClockRearmed: true`）——续跑不是绕过止损线的手段：新预算用完照样会再被掐，同一阶段两次墙钟中止按「停」处置；目标**还在跑**（steer 插话）→ **不重置**，原预算照常到期。`lost` 条目（宿主缺 `interrupt` / 父代理已销毁）不复位，下一次新派发重新计时。
 - **边界**：
   - 预算在**派发时**读入账本：调低不会中断已派发的子代理，只对之后的派发生效（与并发上限同语义）。
   - 中断是**协作式**的：子代理正卡在长工具调用里时要等它观察到取消信号，实际停止可能有延迟。
@@ -350,13 +352,13 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 21 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 27 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
 投递、收尾宽限用尽第二次中断（硬停）、自行 settle 的子代理不被中断、宿主缺 `interrupt` /
 父代理缺失时只告警、以及 `GET /dsh-code-pipeline/status` 的 `budgetMinutes` / `timedOut` /
-`longestRunningMs` 字段。
+`longestRunningMs` 字段、以及**续跑的计时口径**（运行中插话不重置、原预算按时到期、续跑重新起算并按新预算到期、settle 后续跑也重新起算）。
 
 ## 计划的工作流切分（Workstreams）与并行 impl
 
@@ -377,6 +379,13 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.1.17（墙钟与续跑的计时口径）**：
+  - 明确并落实「**每次派发 = 独立墙钟**」：新子代理、新账本条目、派发时快照预算；并行 workstream 各算各的。
+  - `pipeline_followup` 续跑**已停下**的子代理（settled / wrapup-done / stopped）→ 重新起算墙钟并按当时
+    设置取新预算，回执新增 `wallClockRearmed: true`（工具 description 与 render 同步说明）；给**运行中**的
+    子代理插话（steer）**不重置**——否则 steer 就成了绕过止损线的手段；`lost` 条目不复位。
+  - `test/watchdog.smoke.mjs` 扩到 27 项断言：运行中插话不重置、原预算仍按时到期、续跑重新起算并按
+    新预算到期、settle 后续跑（评审第 2 轮那条路）同样重新起算。
 - **0.1.16（墙钟软警告 + 计划工作流切分契约：并行 impl）**：
   - **软警告（80%）**：`SOFT_WARN_RATIO = 0.8` 处先向仍在运行的子代理 steer 一条「开始收尾、
     结束前给状态报告」的消息（`subagents.sendMessage`，最近一个模型步骤可见）；只发一次，

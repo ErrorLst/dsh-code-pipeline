@@ -273,6 +273,47 @@ const allStages = (minutes) => ({ plan: { budgetMinutes: minutes }, impl: { budg
   h.agentsService.get = original;
 }
 
+// 8) 墙钟与续跑（pipeline_followup）：运行中插话不重置；已停下续跑重新起算
+{
+  h.settings.stages = allStages(10);
+  const followup = h.tools.get('pipeline_followup');
+  const run = (child, message) => followup.execute({ child, message }, { agent: h.parent, signal: new AbortController().signal });
+
+  // 8a) 运行中插话：不重置（否则 steer 就是绕过止损线的手段）
+  const beforeRunning = h.interrupts.length;
+  const childA = await dispatch('subagent_impl');
+  advance(9 * MINUTE);
+  const midRun = await run(childA.subagentId, 'keep going, one more thing');
+  check('运行中插话不重置墙钟', midRun.wallClockRearmed === undefined, JSON.stringify(midRun));
+  advance(2 * MINUTE);
+  sweep();
+  await tick(30);
+  const hitsA = h.interrupts.slice(beforeRunning).filter((row) => row.id === childA.subagentId);
+  check('原预算仍按时到期（插话不延长）', hitsA.length === 1, 'hits ' + hitsA.length);
+
+  // 8b) 收尾回合结束后续跑：重新起算，并按当前设置取新预算
+  h.emit('subagent/end', { id: childA.subagentId });
+  h.settings.stages = allStages(4);
+  const beforeRearm = h.interrupts.length;
+  const continued = await run(childA.subagentId, 'now do the remaining part');
+  check('续跑已停下的子代理会重新起算墙钟', continued.wallClockRearmed === true, JSON.stringify(continued));
+  advance(3 * MINUTE);
+  sweep();
+  await tick(30);
+  check('重新起算后按新预算计时（未到点不中断）', h.interrupts.length === beforeRearm, 'got ' + (h.interrupts.length - beforeRearm));
+  advance(2 * MINUTE);
+  sweep();
+  await tick(30);
+  const hitsA2 = h.interrupts.slice(beforeRearm).filter((row) => row.id === childA.subagentId);
+  check('新预算到点再次中断', hitsA2.length === 1, 'hits ' + hitsA2.length);
+
+  // 8c) 正常 settle 后的续跑（评审第 2 轮那条路）同样重新起算
+  const childB = await dispatch('subagent_review', { prompt: 'review it', diff: '@@ -1 +1 @@' });
+  h.emit('subagent/end', { id: childB.subagentId });
+  const settledFollowup = await run(childB.subagentId, 'round 2: here is the new diff');
+  check('settle 后续跑（评审第 2 轮）也重新起算', settledFollowup.wallClockRearmed === true, JSON.stringify(settledFollowup));
+}
+
 console.log('');
 console.log(checks + ' checks, ' + failures.length + ' failure(s)');
 if (failures.length > 0) {
