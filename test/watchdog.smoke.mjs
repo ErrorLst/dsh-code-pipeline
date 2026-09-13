@@ -1,10 +1,10 @@
-// @dsh-external/dsh-code-pipeline — 假 ctx 集成冒烟：每阶段墙钟预算（0.1.15）
+// @dsh-external/dsh-code-pipeline — 假 ctx 集成冒烟：每阶段墙钟预算（0.1.16）
 //
-// 覆盖：预算到点 -> 中断 + queue 收尾投递；预算 0 不误伤；子代理自行 settle 不误伤；
-//       收尾宽限用尽 -> 第二次中断（硬停）；宿主缺 interrupt / 父代理缺失时只告警；
-//       status 端点新字段；阶段工具 description 带 WALL-CLOCK BUDGET。
+// 覆盖：预算到点 -> 中断 + queue 收尾投递；80% 软警告（only once / 只在运行中）；预算 0 不误伤；
+//       子代理自行 settle 不误伤；收尾宽限用尽 -> 第二次中断（硬停）；宿主缺 interrupt /
+//       父代理缺失时只告警；status 端点新字段；阶段工具 description 的墙钟与 workstreams 文案。
 //
-// 运行：node test/watchdog.smoke.mjs
+// 运行：node test/watchdog.smoke.mjs（或 npm test）
 // 依赖：@deepseek-ai/schemastery 必须可解析（pnpm install，或本地开发时链接宿主副本）。
 
 import { cpSync, mkdirSync, mkdtempSync } from 'node:fs';
@@ -34,6 +34,8 @@ Date.now = () => realNow() + timeOffset;
 const advance = (ms) => { timeOffset += ms; };
 const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const MINUTE = 60 * 1000;
+
 let sweep;
 globalThis.setInterval = (fn) => { sweep = fn; return { unref() {} }; };
 globalThis.clearInterval = () => {};
@@ -46,6 +48,7 @@ function createHarness() {
   const warnings = [];
   const interrupts = [];
   const queued = [];
+  const steers = [];
   const children = new Map();
   const settings = { stages: {} };
   let childSeq = 0;
@@ -83,7 +86,10 @@ function createHarness() {
       if (row) row.activity = 'idle';
     },
     prompt: async (payload) => { queued.push(payload); return { messageId: 'msg-1' }; },
-    sendMessage: async () => 'msg-2',
+    sendMessage: async (_parent, childId, content) => {
+      steers.push({ childId, text: String(content?.[0]?.text ?? '') });
+      return 'msg-2';
+    },
   };
 
   const ctx = {
@@ -103,7 +109,7 @@ function createHarness() {
   };
 
   return {
-    ctx, parent, settings, tools, routes, warnings, interrupts, queued, children,
+    ctx, parent, settings, tools, routes, warnings, interrupts, queued, steers, children,
     agentsService, subagents,
     emit: (name, payload) => { for (const fn of handlers.get(name) ?? []) fn(payload); },
   };
@@ -137,6 +143,11 @@ check(
   '阶段工具 description 带 WALL-CLOCK BUDGET',
   ['subagent_plan', 'subagent_impl', 'subagent_review'].every((name) => String(h.tools.get(name)?.description ?? '').includes('WALL-CLOCK BUDGET')),
 );
+check(
+  'plan 工具 description 带 WORKSTREAMS 契约（impl/review 不带）',
+  String(h.tools.get('subagent_plan')?.description ?? '').includes('WORKSTREAMS')
+    && !String(h.tools.get('subagent_impl')?.description ?? '').includes('WORKSTREAMS'),
+);
 
 const dispatch = (toolName, args = {}) => h.tools.get(toolName).execute(
   { prompt: 'do the thing', ...args },
@@ -147,49 +158,61 @@ const statusOf = async () => {
   await h.routes.get('/dsh-code-pipeline/status')({}, res);
   return JSON.parse(captured.body).stages;
 };
+const allStages = (minutes) => ({ plan: { budgetMinutes: minutes }, impl: { budgetMinutes: minutes }, review: { budgetMinutes: minutes } });
 
 // 1) 默认预算 0：再久也不动手
 {
-  const before = h.interrupts.length;
+  const beforeInterrupts = h.interrupts.length;
+  const beforeSteers = h.steers.length;
   const result = await dispatch('subagent_impl');
-  advance(2 * 60 * 60 * 1000);
-  sweep();
-  await tick();
-  check('预算 0（默认）不触发中断', h.interrupts.length === before && result.kind === 'continuable');
-}
-
-// 2) 预算 1 分钟：中断 + queue 收尾投递 + status 字段
-{
-  h.settings.stages = { plan: { budgetMinutes: 1 }, impl: { budgetMinutes: 1 }, review: { budgetMinutes: 1 } };
-  const before = h.interrupts.length;
-  const result = await dispatch('subagent_impl');
-  advance(61 * 1000);
+  advance(2 * 60 * MINUTE);
   sweep();
   await tick(30);
-  const interrupt = h.interrupts[before];
-  check('预算到点触发一次中断', h.interrupts.length === before + 1, 'got ' + (h.interrupts.length - before));
+  check('预算 0（默认）既不中断也不软警告',
+    h.interrupts.length === beforeInterrupts && h.steers.length === beforeSteers && result.kind === 'continuable');
+}
+
+// 2) 预算 10 分钟：80% 处一次软警告（steer），到点才硬中断 + 收尾投递
+{
+  h.settings.stages = allStages(10);
+  const beforeInterrupts = h.interrupts.length;
+  const beforeQueued = h.queued.length;
+  const result = await dispatch('subagent_impl');
+  advance(8.5 * MINUTE);
+  sweep();
+  await tick(30);
+  check('80% 处发出一次软警告（steer 到该子代理）',
+    h.steers.length === 1 && h.steers[0].childId === result.subagentId && h.steers[0].text.includes('wall-clock budget'),
+    JSON.stringify(h.steers[0] ?? null));
+  check('软件警告要求收尾并给报告', h.steers[0].text.includes('Start wrapping up') && h.steers[0].text.includes('status report'));
+  check('软警告阶段不中断', h.interrupts.length === beforeInterrupts);
+  sweep();
+  await tick(30);
+  check('软警告不重复发', h.steers.length === 1, 'got ' + h.steers.length);
+  advance(2 * MINUTE);
+  sweep();
+  await tick(30);
+  const interrupt = h.interrupts[beforeInterrupts];
+  check('到点触发一次硬中断', h.interrupts.length === beforeInterrupts + 1, 'got ' + (h.interrupts.length - beforeInterrupts));
   check('中断目标是刚派发的子代理', interrupt?.id === result.subagentId, String(interrupt?.id));
-  check(
-    '中断授权用派发时的父代理（ancestor）',
-    interrupt?.authority?.kind === 'ancestor' && interrupt?.authority?.agent === h.parent,
-  );
-  check(
-    '收尾指令经 queue 通道投递',
-    h.queued.length === 1 && h.queued[0].delivery === 'queue' && h.queued[0].mode === 'continuable',
-    JSON.stringify(h.queued[0]?.delivery),
-  );
-  const text = String(h.queued[0]?.content?.[0]?.text ?? '');
+  check('中断授权用派发时的父代理（ancestor）',
+    interrupt?.authority?.kind === 'ancestor' && interrupt?.authority?.agent === h.parent);
+  check('收尾指令经 queue 通道投递',
+    h.queued.length === beforeQueued + 1
+      && h.queued[beforeQueued].delivery === 'queue'
+      && h.queued[beforeQueued].mode === 'continuable'
+      && h.queued[beforeQueued].childSessionId === result.subagentId,
+    JSON.stringify(h.queued[beforeQueued] ?? null));
+  const text = String(h.queued[beforeQueued]?.content?.[0]?.text ?? '');
   check('收尾指令要求只报告、不改工作区', text.includes('wall-clock budget') && text.includes('do NOT edit files'), text.slice(0, 60));
   const stages = await statusOf();
-  check(
-    'status 报出 budgetMinutes / timedOut / longestRunningMs',
-    stages.impl?.budgetMinutes === 1 && stages.impl?.timedOut === 1 && stages.impl?.longestRunningMs >= 60000,
-    JSON.stringify(stages.impl),
-  );
+  check('status 报出 budgetMinutes / timedOut / longestRunningMs',
+    stages.impl?.budgetMinutes === 10 && stages.impl?.timedOut >= 1 && stages.impl?.longestRunningMs >= 10 * MINUTE,
+    JSON.stringify(stages.impl));
 
   // 3) 收尾宽限用尽 -> 第二次中断（硬停）
   h.children.set(result.subagentId, { activity: 'running' });
-  advance(4 * 60 * 1000);
+  advance(4 * MINUTE);
   const beforeGrace = h.interrupts.length;
   sweep();
   await tick(30);
@@ -198,38 +221,52 @@ const statusOf = async () => {
   h.children.set(result.subagentId, { activity: 'idle' });
 }
 
-// 4) 子代理自行 settle：不误伤
+// 4) 子代理不在跑（idle）：不发软警告（steer 对 idle 目标是开新回合）
+{
+  const result = await dispatch('subagent_plan');
+  h.children.set(result.subagentId, { activity: 'idle' });
+  advance(8.5 * MINUTE);
+  const beforeSteers = h.steers.length;
+  sweep();
+  await tick(30);
+  check('子代理不在跑时不发软警告', h.steers.length === beforeSteers, 'got ' + (h.steers.length - beforeSteers));
+  // 这个 idle 子代理在本场景里退出舞台：补一条 settle，避免它在后续场景的巡检里被算作超时。
+  h.emit('subagent/end', { id: result.subagentId });
+}
+
+// 5) 子代理自行 settle：不误伤
 {
   const before = h.interrupts.length;
   const result = await dispatch('subagent_impl');
   h.emit('subagent/end', { id: result.subagentId });
   h.children.set(result.subagentId, { activity: 'idle' });
-  advance(10 * 60 * 1000);
+  advance(20 * MINUTE);
   sweep();
-  await tick();
-  check('自行 settle 的子代理不被中断', h.interrupts.length === before);
+  await tick(30);
+  const touches = h.interrupts.slice(before).filter((row) => row.id === result.subagentId);
+  check('自行 settle 的子代理不被中断', touches.length === 0, 'touches ' + touches.length);
 }
 
-// 5) 宿主缺 subagents.interrupt：只告警，不抛
+// 6) 宿主缺 subagents.interrupt：只告警，不抛
 {
   const original = h.subagents.interrupt;
   delete h.subagents.interrupt;
   const before = h.warnings.length;
   await dispatch('subagent_review');
-  advance(61 * 1000);
+  advance(11 * MINUTE);
   sweep();
   await tick(30);
   check('宿主缺 interrupt 时只告警', h.warnings.slice(before).some((line) => line.includes('subagents.interrupt is unavailable')));
   h.subagents.interrupt = original;
 }
 
-// 6) 父代理缺失：只告警，不抛
+// 7) 父代理缺失：只告警，不抛
 {
   const original = h.agentsService.get;
   h.agentsService.get = () => undefined;
   const before = h.warnings.length;
   await dispatch('subagent_plan');
-  advance(61 * 1000);
+  advance(11 * MINUTE);
   sweep();
   await tick(30);
   check('父代理不在时只告警', h.warnings.slice(before).some((line) => line.includes('is no longer live')));

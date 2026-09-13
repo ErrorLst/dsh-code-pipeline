@@ -290,6 +290,7 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   `maxParallelToolCalls`；`dsh-tool-call-timeout-policy` 只管单次工具调用），一个跑飞的 impl
   只能由模型自己决定停下，于是长时间烧 token、工作区停在半成品。
 - **超时后插件做什么**（15 秒一轮巡检账本）：
+  0. **软警告（预算 80%）**：`SOFT_WARN_RATIO = 0.8` 处先给**仍在运行**的子代理插一条 steer 消息（`subagents.sendMessage`）：「预算只剩 X 分钟，开始收尾：做完手上这一处、不要开新工作、只跑必要检查，结束前给一段状态报告」。它在最近一个模型步骤就能看到，多数情况会自己收敛、不必掐；只发一次，失败只记日志、不影响硬路径。子代理不在跑（idle）时**不发**——steer 对 idle 目标是「开一个新回合」。
   1. **中断**：`subagents.interrupt(childId, { kind: "ancestor", agent: parent })` —— 只结束
      **当前回合**；Activation、未领取的 inbox、已发布的下级都保留，所以之后仍可用
      `pipeline_followup` 把剩下的活儿交回**同一个**子代理（前缀还在，命中缓存）。
@@ -349,14 +350,47 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 15 项断言：阶段工具与 `pipeline_followup`
-注册、阶段工具 description 带 WALL-CLOCK BUDGET、预算 0 不误伤、预算到点中断一次
-（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"` 投递、收尾宽限用尽第二次中断
-（硬停）、自行 settle 的子代理不被中断、宿主缺 `interrupt` / 父代理缺失时只告警、以及
-`GET /dsh-code-pipeline/status` 的 `budgetMinutes` / `timedOut` / `longestRunningMs` 字段。
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 21 项断言：阶段工具与 `pipeline_followup`
+注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
+不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
+不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
+投递、收尾宽限用尽第二次中断（硬停）、自行 settle 的子代理不被中断、宿主缺 `interrupt` /
+父代理缺失时只告警、以及 `GET /dsh-code-pipeline/status` 的 `budgetMinutes` / `timedOut` /
+`longestRunningMs` 字段。
+
+## 计划的工作流切分（Workstreams）与并行 impl
+
+并行 impl 的前提是**互不重叠的文件所有权**——同一份文件被两个实现者同时改会互相覆盖。这条契约落在两处：
+
+- **plan 阶段（阶段 persona + 工具 description）**：计划必须以 `## Workstreams` 表结尾（`id / goal / owned files（精确路径或 glob）/ depends on / acceptance check`），
+  或者一句话 `Workstreams: single workstream`（小改动 / 单文件 / 本质上串行）。硬规则：任一文件只能出现在一个
+  workstream；共享串行点（`package.json`、lockfile、`index`/barrel、迁移、生成物）收进最后一个 `integration`
+  workstream（依赖其余）；一个 workstream 必须值得独占一个子代理（大致 >1 个文件或 >15 分钟），不要把一件
+  连贯的改动静默拆成无法各自验证的碎片；每个 workstream 自带验收检查。
+- **主代理（预设 persona）**：当计划声明 ≥2 个「文件不相交且无依赖」的 workstream 时，**在一个程序里并行派发**
+  每个独立 workstream 一个 `subagent_impl`（`Promise.all`）；有依赖或共享文件的顺序执行，`integration` 最后跑。
+  评审阶段按 workstream 各自捕获**路径受限 diff**（`git diff HEAD -- <该 workstream 的 owned paths>`）交给各自的
+  `subagent_review`——并行期间同一工作区的 `git diff HEAD` 会混入别人的改动。切分不清楚或看起来不对时，
+  **让 plan 阶段改计划**，不要自己发明切分。
+- **为什么值得**：独立目标并行会缩短 wall-clock；每个子代理的会话更短、更早收敛，大任务的总 token 通常也更省
+  （代价是每个子代理各付一次 system/persona/派发消息，所以小任务不切）。
 
 ## 变更记录
 
+- **0.1.16（墙钟软警告 + 计划工作流切分契约：并行 impl）**：
+  - **软警告（80%）**：`SOFT_WARN_RATIO = 0.8` 处先向仍在运行的子代理 steer 一条「开始收尾、
+    结束前给状态报告」的消息（`subagents.sendMessage`，最近一个模型步骤可见）；只发一次，
+    只在确认运行中时发（steer 对 idle 目标是开新回合），失败只记日志。硬超时路径不变。
+  - **plan 阶段产出 `## Workstreams` 切分表**（persona + plan 工具 description）：`id / goal /
+    owned files / depends on / acceptance check`，任一文件只能属于一个 workstream，共享串行点
+    收进 `integration`，或直接 `Workstreams: single workstream`。
+  - **预设 persona 的并行协议**：≥2 个文件不相交且无依赖的 workstream → 一个程序里并行派发
+    `subagent_impl`；评审按 workstream 捕获**路径受限 diff**（`git diff HEAD -- <paths>`）各自评审；
+    切分不清就先让 plan 改计划。
+  - **新增「Wall-clock interruption」处置协议 + 两条 Invariant**：墙钟中止 **不是**阶段不可用 ——
+    读收尾报告后三选一：**续**（`pipeline_followup` 同一个孩子，最省）／**拆**（剩余工作拆小重派）／
+    **停**（同阶段两次超时或半成品无法自洽 → 报告用户）；绝不静默重试、绝不自己修补。
+  - 预设头部注释、`preset.yml` 描述、设置卡片文案同步；`test/watchdog.smoke.mjs` 扩到 21 项断言。
 - **0.1.15（每阶段墙钟预算：超时自动中断 + 自动索取收尾报告）**：
   - **问题**：宿主对子代理没有回合 / 步数 / 时长上限（agent-loop 的 Config 只有
     `maxParallelToolCalls`；`dsh-tool-call-timeout-policy` 只管单次工具调用），一个跑飞的 impl
