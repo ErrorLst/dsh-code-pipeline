@@ -331,6 +331,13 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
     「0.1.3+ → alpha.4 → 更早」顺序探测，首个被接受的形状即采用。
   - 会话格式 v2 把助手流内联进 `assistant/message` / `assistant/attempt` 的
     `data.stream`（与本插件无直接关系，但会话读取类插件需注意）。
+- **dsh 0.1.6-alpha.1 的包名变更（本插件已适配）**：工作流引擎 `@deepseek-ai/dsh-workflow-worker-thread`
+  → **`@deepseek-ai/dsh-workflow-ptc`**（行 id 同步改为 `workflow-ptc`），实现改为在沙箱化的 PTC
+  Node 进程里执行工作流（脚本仍保留 `agent()` / `parallel()` / `pipeline()` / `phase()` / `log()`）。
+  旧包名不再解析，残留一行就会让**整份预设挂载失败**：实测报 `agent-presets: preset "code-pipeline"
+  failed to mount: row "workflow-worker-thread" names a plugin that cannot be resolved`，会话 resume 直接
+  失败（`gateway/internal`）。上游 `ptc` 预设把它与 `tool-ralph` 一起 disabled；本预设为 `ralph`
+  保留引擎（不 disabled），`tool-workflow` 仍 disabled。
 - 工具注册的层由注册时 ctx 的作用域决定（实测：预设 standing 挂载不向其他
   会话泄漏）；通过 `agent.ctx` 注册落入该代理自身层，代理销毁自动回收。
 - `tools.restrict` 只过滤继承层（global + 祖先），不过滤代理自身层 —— 因此
@@ -379,6 +386,21 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.1.18（适配 dsh 0.1.6-alpha.1：工作流引擎改名 workflow-ptc）**：
+  - **症状**：升级后预设挂载失败 —— `row "workflow-worker-thread" names a plugin that cannot be
+    resolved: @deepseek-ai/dsh-workflow-worker-thread`，resume 会话直接 `RemoteError ... (gateway/internal)`。
+  - **原因**：0.1.6-alpha.1 把工作流引擎包改名并重写：`@deepseek-ai/dsh-workflow-worker-thread` →
+    `@deepseek-ai/dsh-workflow-ptc`（行 id 也改成 `workflow-ptc`）。预设行名不会自动迁移，旧包名
+    解析失败即整份预设拒绝挂载。
+  - **修复**：预设行改为 `- id: workflow-ptc` / `'@deepseek-ai/dsh-workflow-ptc'`，仍 `provider: spawn`
+    且不 disabled（本预设为 `ralph` 保留引擎）；预设头部注释记录改名与上游默认（upstream ptc 把
+    它与 `tool-ralph` 一起关掉）。
+  - **核对**（脚本化）：预设引用的 25 个 `@deepseek-ai/*` 包名 + 28 个配置字段全部在 0.1.6-alpha.1
+    中可解析/仍存在；插件用到的宿主服务（agents / agentPresets / subagents / settings / tools /
+    webServer）、事件（agent/created、agent-preset/selected、subagent/end、agent/disposed、
+    agent/request、subagent/provider-added）与方法（startContinuable / listChildren / interrupt /
+    sendMessage / prompt / installSection / composedPreset / isOwnedBy）逐一核对未变。
+  - 本轮只改 `preset/`（lib/ 与 0.1.17 一致）。
 - **0.1.17（墙钟与续跑的计时口径）**：
   - 明确并落实「**每次派发 = 独立墙钟**」：新子代理、新账本条目、派发时快照预算；并行 workstream 各算各的。
   - `pipeline_followup` 续跑**已停下**的子代理（settled / wrapup-done / stopped）→ 重新起算墙钟并按当时

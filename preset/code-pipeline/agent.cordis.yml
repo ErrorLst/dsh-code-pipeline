@@ -37,6 +37,14 @@
 #      stage unavailability — the persona's «Wall-clock interruption» section
 #      fixes the continue / split / stop decision.
 #
+#      Host-package note (dsh 0.1.6-alpha.1): the workflow engine row is
+#      `workflow-ptc` / '@deepseek-ai/dsh-workflow-ptc' (was
+#      `workflow-worker-thread` / '@deepseek-ai/dsh-workflow-worker-thread').
+#      The old name no longer resolves and fails the whole preset mount
+#      (`row "..." names a plugin that cannot be resolved`). Upstream `ptc`
+#      disables it together with `tool-ralph`; this preset keeps the engine
+#      because it keeps `ralph`.
+#
 #      Implementation plans end with a `## Workstreams` map (disjoint owned
 #      files + dependencies + acceptance checks): independent workstreams are
 #      dispatched in parallel, each workstream's diff is captured path-scoped
@@ -393,8 +401,14 @@
         backgroundMode: one-shot
         maxDepth: provider-managed
 
-    - id: workflow-worker-thread
-      name: '@deepseek-ai/dsh-workflow-worker-thread'
+    # dsh 0.1.6-alpha.1 把工作流引擎改名并重写：@deepseek-ai/dsh-workflow-worker-thread
+    # -> @deepseek-ai/dsh-workflow-ptc（行 id 同步改为 workflow-ptc）——旧包名已不存在，
+    # 残留即整份预设挂载失败（row names a plugin that cannot be resolved）。新实现是在
+    # 沙箱化的 PTC Node 进程里跑工作流，脚本保留 agent()/parallel()/pipeline()/phase()/log()
+    # 钩子。上游 ptc 预设把它连同 tool-ralph 一起 disabled（PTC 模式不再要第二个编排面）；
+    # 本预设为 `ralph` 保留引擎，所以这里不 disabled。
+    - id: workflow-ptc
+      name: '@deepseek-ai/dsh-workflow-ptc'
       config:
         provider: spawn
 
