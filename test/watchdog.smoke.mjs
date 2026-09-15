@@ -51,6 +51,10 @@ function createHarness() {
   const steers = [];
   const children = new Map();
   const settings = { stages: {} };
+  // 宿主调用记账：实参形状与调用次数（宿主契约回归——漏传 signal 会让脚本变红）。
+  // promptPayloads 在"判定接受之前"记录每次尝试的载荷：探测表的尝试序列因此可断言
+  // （光看 queued[last] 看不出中间试过哪些形状）。
+  const calls = { prompt: 0, promptPayloads: [], promptSignals: [], startSignals: [], sendMessageOptions: [], rejectDelivery: false, rejectKnownShapes: false, rewriteBadPayloadMessage: false };
   let childSeq = 0;
 
   const toolsRegistry = { register: (def) => tools.set(def.name, def) };
@@ -73,7 +77,17 @@ function createHarness() {
   };
   const subagents = {
     getProvider: (name) => ({ name }),
-    startContinuable: async () => {
+    startContinuable: async (spec) => {
+      // 宿主契约（packages/subagent/subagent/src/types.ts:32-50，continuation.ts:102）：
+      // spec.signal 是必填 AbortSignal，spec.request.prompt 是 ContentBlock[]。
+      // 形状不符就抛与宿主同形的 TypeError，而不是静默接受。
+      if (!(spec?.signal instanceof AbortSignal)) {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
+      }
+      if (spec?.request?.prompt?.[0]?.type !== 'text') {
+        throw new TypeError('subagent start request carries no text prompt');
+      }
+      calls.startSignals.push(spec.signal);
       childSeq += 1;
       const childId = 'child-' + childSeq;
       children.set(childId, { activity: 'running' });
@@ -85,8 +99,43 @@ function createHarness() {
       const row = children.get(id);
       if (row) row.activity = 'idle';
     },
-    prompt: async (payload) => { queued.push(payload); return { messageId: 'msg-1' }; },
-    sendMessage: async (_parent, childId, content) => {
+    prompt: async (payload, signal) => {
+      calls.prompt += 1;
+      // 宿主 continuation-activation.ts:489 对 signal 做 signal.throwIfAborted()：
+      // 漏传尾部 transport 实参在这里必然 TypeError。
+      if (!(signal instanceof AbortSignal)) {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
+      }
+      // 判定"接受"之前记账：拒绝路径也要留下痕迹，否则场景 10 的尝试序列无法断言。
+      calls.promptPayloads.push(payload);
+      // 可选的旧宿主模拟：
+      //   rejectDelivery     —— 只拒带 delivery 的当前形状，逼探测表走第二项；
+      //   rejectKnownShapes  —— 两种已知形状都拒（探测表全部项都被拒），逼出探测表真实
+      //                         长度：把已删除的第三项 mode:'queue' 加回去就会多一次尝试。
+      if (calls.rejectDelivery && (calls.rejectKnownShapes || payload?.delivery !== undefined)) {
+        // 与宿主同形的 gateway/bad-request 校验失败
+        // （packages/subagent/subagent/src/control.ts:44-47）：message 是模板串，
+        // details.issues 是结构化问题列表（remote-error.ts:22-30）。
+        const error = new Error(
+          calls.rewriteBadPayloadMessage
+            // 宿主改文案的模拟：前缀判定失效，结构化 issues 兜底必须接住。
+            ? 'payload rejected: subagent.prompt'
+            : 'invalid payload for subagent.prompt',
+        );
+        error.code = 'gateway/bad-request';
+        error.details = { issues: [{ code: 'invalid_literal', path: ['delivery'] }] };
+        throw error;
+      }
+      calls.promptSignals.push(signal);
+      queued.push(payload);
+      return { messageId: 'msg-1' };
+    },
+    sendMessage: async (_parent, childId, content, options) => {
+      // 宿主 SubagentSendMessageOptions.signal 必填（types.ts:70-73）。
+      if (!(options?.signal instanceof AbortSignal)) {
+        throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
+      }
+      calls.sendMessageOptions.push(options);
       steers.push({ childId, text: String(content?.[0]?.text ?? '') });
       return 'msg-2';
     },
@@ -110,7 +159,7 @@ function createHarness() {
 
   return {
     ctx, parent, settings, tools, routes, warnings, interrupts, queued, steers, children,
-    agentsService, subagents,
+    agentsService, subagents, calls,
     emit: (name, payload) => { for (const fn of handlers.get(name) ?? []) fn(payload); },
   };
 }
@@ -159,6 +208,14 @@ const statusOf = async () => {
   return JSON.parse(captured.body).stages;
 };
 const allStages = (minutes) => ({ plan: { budgetMinutes: minutes }, impl: { budgetMinutes: minutes }, review: { budgetMinutes: minutes } });
+const followup = (child, message) => h.tools.get('pipeline_followup').execute(
+  { child, message },
+  { agent: h.parent, signal: new AbortController().signal },
+);
+// 探测表载荷的简写形状（断言失败时把"到底试了哪些形状"打出来）。
+const shapeOf = (row) => row === undefined
+  ? '<none>'
+  : String(row?.mode) + (row?.delivery === undefined ? '' : ' + delivery:' + String(row.delivery));
 
 // 1) 默认预算 0：再久也不动手
 {
@@ -313,6 +370,121 @@ const allStages = (minutes) => ({ plan: { budgetMinutes: minutes }, impl: { budg
   const settledFollowup = await run(childB.subagentId, 'round 2: here is the new diff');
   check('settle 后续跑（评审第 2 轮）也重新起算', settledFollowup.wallClockRearmed === true, JSON.stringify(settledFollowup));
 }
+
+// 9) queue 投递路径（followupMode: 'queue'）：pipeline_followup 走 subagents.prompt，
+//    载荷必须是宿主 control schema 的唯一合法形状 mode:'continuable' + delivery:'queue'，
+//    且首项即被接受——探测表不得发生第 2 次尝试。
+{
+  h.settings.stages = allStages(0); // 本场景不设墙钟，避免巡检干扰
+  h.settings.followupMode = 'queue';
+  const child = await dispatch('subagent_impl');
+  h.children.set(child.subagentId, { activity: 'idle' });
+  const beforeAttempts = h.calls.prompt;
+  const beforeQueued = h.queued.length;
+  let result;
+  try {
+    result = await followup(child.subagentId, 'queued requirement change');
+  } catch (error) {
+    result = { threw: String(error?.message ?? error) };
+  }
+  const payload = h.queued[beforeQueued];
+  check('followupMode=queue：pipeline_followup 成功返回并透出宿主回执的 messageId',
+    result.ok === true && result.messageId === 'msg-1' && result.childId === child.subagentId,
+    JSON.stringify(result));
+  check('queue 载荷是宿主唯一合法形状（mode=continuable + delivery=queue）',
+    payload?.mode === 'continuable' && payload?.delivery === 'queue'
+      && payload?.childSessionId === child.subagentId
+      && payload?.content?.[0]?.text === 'queued requirement change',
+    JSON.stringify(payload ?? null));
+  check('queue 投递只发生一次尝试（探测表首项即被接受，无第 2 次尝试）',
+    h.calls.prompt === beforeAttempts + 1, 'attempts ' + (h.calls.prompt - beforeAttempts));
+  h.emit('subagent/end', { id: child.subagentId });
+  h.settings.followupMode = 'steer';
+}
+
+// 10) 探测表回退（两种已知形状都被宿主拒 = 探测表被走到底）：只尝试两次
+//     「带 delivery 的当前形状」→「不带 delivery 的 continuable」，绝不尝试已删除的
+//     mode:'queue'（第三项）。两种形状都拒是关键：只要第二项被接受，把第三项加回
+//     探测表也不会多出任何一次尝试，断言就失去回归保护力。
+{
+  h.settings.stages = allStages(0);
+  h.settings.followupMode = 'queue';
+  const child = await dispatch('subagent_plan');
+  h.children.set(child.subagentId, { activity: 'idle' });
+  const beforeAttempts = h.calls.prompt;
+  h.calls.rejectDelivery = true;
+  h.calls.rejectKnownShapes = true;
+  let result;
+  try {
+    result = await followup(child.subagentId, 'legacy host shape');
+  } catch (error) {
+    result = { threw: String(error?.message ?? error) };
+  } finally {
+    h.calls.rejectDelivery = false;
+    h.calls.rejectKnownShapes = false;
+  }
+  check('两种已知形状都被拒：探测表只尝试两次',
+    h.calls.prompt === beforeAttempts + 2,
+    'attempts ' + (h.calls.prompt - beforeAttempts) + ' result ' + JSON.stringify(result));
+  // 尝试序列（假宿主在判定接受之前记账）——这是"已删除的第三项永不被尝试"的有效断言：
+  // 计数断言只能拦住更长的探测表（把 mode:'queue' 那一项加回就会多出一次尝试），序列
+  // 断言额外钉住每次尝试的形状——回退项必须是不带 delivery 的 continuable（只改形状、
+  // 例如给第二项加 delivery:'steer'，计数仍是 2、计数断言察觉不到，形状只能靠序列断言拦住）。
+  const fallbackAttempts = h.calls.promptPayloads.slice(beforeAttempts);
+  check('回退的尝试序列恰为 [continuable+delivery, continuable]，没有任何 mode=queue',
+    fallbackAttempts.length === 2
+      && fallbackAttempts[0]?.mode === 'continuable' && fallbackAttempts[0]?.delivery === 'queue'
+      && fallbackAttempts[1]?.mode === 'continuable' && fallbackAttempts[1]?.delivery === undefined
+      && !fallbackAttempts.some((row) => row?.mode === 'queue'),
+    'sequence [' + fallbackAttempts.map(shapeOf).join(', ') + ']');
+  h.emit('subagent/end', { id: child.subagentId });
+  h.settings.followupMode = 'steer';
+}
+
+// 11) 宿主改写文案时靠结构化 details.issues 兜底继续探测：code 仍是
+//     gateway/bad-request，但 message 已被改写（不再以 "invalid payload for
+//     subagent.prompt" 开头）——前缀判定失效。旧实现（整句相等，以及本轮修掉的三元
+//     "message 是字符串就看前缀、否则看 issues"）在这里都会放弃回退、把带 delivery
+//     的形状第一次被拒就当失败；OR 兜底必须仍然回退到第二项并成功投递。
+{
+  h.settings.stages = allStages(0);
+  h.settings.followupMode = 'queue';
+  const child = await dispatch('subagent_impl');
+  h.children.set(child.subagentId, { activity: 'idle' });
+  const beforeAttempts = h.calls.prompt;
+  h.calls.rejectDelivery = true;
+  h.calls.rewriteBadPayloadMessage = true;
+  let result;
+  try {
+    result = await followup(child.subagentId, 'rewritten host message');
+  } catch (error) {
+    result = { threw: String(error?.message ?? error) };
+  } finally {
+    h.calls.rejectDelivery = false;
+    h.calls.rewriteBadPayloadMessage = false;
+  }
+  const retryAttempts = h.calls.promptPayloads.slice(beforeAttempts);
+  check('宿主改写文案但带 details.issues：结构化兜底仍触发回退（前缀判定失效不影响）',
+    retryAttempts.length === 2
+      && retryAttempts[0]?.mode === 'continuable' && retryAttempts[0]?.delivery === 'queue'
+      && retryAttempts[1]?.mode === 'continuable' && retryAttempts[1]?.delivery === undefined,
+    'sequence [' + retryAttempts.map(shapeOf).join(', ') + '] result ' + JSON.stringify(result));
+  check('文案改写场景回退后同样返回宿主回执 messageId', result?.messageId === 'msg-1', JSON.stringify(result));
+  check('回退成功后队列里落的是不带 delivery 的 continuable 载荷',
+    h.queued[h.queued.length - 1]?.mode === 'continuable'
+      && h.queued[h.queued.length - 1]?.delivery === undefined,
+    JSON.stringify(h.queued[h.queued.length - 1] ?? null));
+  h.emit('subagent/end', { id: child.subagentId });
+  h.settings.followupMode = 'steer';
+}
+
+check(
+  '假 ctx 全程按宿主契约校验实参形状（startContinuable / prompt / sendMessage 均带 signal）',
+  h.calls.startSignals.length > 0
+    && h.calls.promptSignals.length > 0
+    && h.calls.sendMessageOptions.length > 0,
+  JSON.stringify({ start: h.calls.startSignals.length, prompt: h.calls.promptSignals.length, sendMessage: h.calls.sendMessageOptions.length }),
+);
 
 console.log('');
 console.log(checks + ' checks, ' + failures.length + ' failure(s)');

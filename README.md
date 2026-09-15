@@ -209,14 +209,15 @@ UUID），子代理提示中仅保留
 ## 长任务与后台派发
 
 阶段工具**没有工具级超时**（未声明 `timeoutMs`，不会触发官方 timeout policy）；但前台等待
-受当前回合/调度生命周期约束，长跑阶段可能被回合边界截断（如单回合 20 分钟限制）。
+受当前回合/调度生命周期约束，长跑阶段可能被回合边界截断（宿主 `run_code` 的墙钟默认 120 s、
+部署上限 600 s，传 `timeoutMs` 可顶到部署上限）。
 
 - **后台模式（默认，推荐）**：`run_in_background` 省略/为 `true`——立即返回
   `{"kind":"continuable","subagentId":"..."}` 并结束回合；阶段子代理独立会话继续运行，
   **完成后 runtime 自动向本会话发送通知**（含结果与最终回复）；
 - **前台模式（仅短任务）**：`run_in_background: false`——等待阶段结果；**注意**
-  `run_code` 程序有 20 分钟 wall-clock 上限，超过会截断等待并取消子代理，所以只有
-  几分钟内能完成的小任务才用前台；
+  `run_code` 程序的墙钟**默认 120 s、部署上限 600 s**（传 `timeoutMs` 可顶到上限），
+  超过会截断等待并取消子代理，所以只有几分钟内能完成的小任务才用前台；
 - **状态可见**：`list_agents`（running / idle / ready）、`send_message` 继续子代理；
   完成通知里就带子代理的 outcome 与最终回复（没有独立的 history 工具，
   所以阶段子代理必须把完整结论写进最终回复），GUI 子代理视图同步展示；
@@ -327,8 +328,10 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
     `suffix`（可选）；旧 `text` 会让该行激活失败，整个预设挂载报
     `agent-preset/invalid`。预设内用 `prefix`（section 序号与旧 `text` 相同）。
   - `subagents.prompt`（pipeline_followup 的 queue 通道）的载荷新增必填
-    `delivery: 'queue' | 'steer'`，`mode` 固定 `'continuable'`；插件按
-    「0.1.3+ → alpha.4 → 更早」顺序探测，首个被接受的形状即采用。
+    `delivery: 'queue' | 'steer'`，`mode` 固定 `'continuable'`——宿主 control schema 的
+    **唯一合法判别符**就是 `z.literal('continuable')`（`packages/subagent/subagent/src/control.ts:23`），
+    不存在 `mode: 'queue'` 这种形状；插件只探测两项（带 `delivery` 的当前形状 → 不带
+    `delivery` 的旧形状），首个被接受的形状即采用。
   - 会话格式 v2 把助手流内联进 `assistant/message` / `assistant/attempt` 的
     `data.stream`（与本插件无直接关系，但会话读取类插件需注意）。
 - **dsh 0.1.6-alpha.1 的包名变更（本插件已适配）**：工作流引擎 `@deepseek-ai/dsh-workflow-worker-thread`
@@ -348,6 +351,14 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   按 `subagent/descriptor`（provider/model/persona/toolFilter）重建会话，且
   `activation.announced = true` 保证再次 settle 时父会话仍收到完成通知 —— 所以「续用同一个
   评审子代理」在现有工具下即可成立，无需新增任何工具或参数。
+- **`subagents.prompt(request, signal)` 的 `signal` 是生成式 Remote 的尾部 transport 参数**：
+  它不进入 wire args，只作为宿主方法的**最后一个形参**注入
+  （`packages/typert/protocol/src/types.ts:288-292` 的 `cancellation.parameter: 'signal'`），
+  因此**进程内直接调用也必须显式传入第二个实参**。漏传时宿主在
+  `signal.throwIfAborted()`（`packages/subagent/subagent/src/continuation-activation.ts:489`）上
+  直接 TypeError，表现成「queue 投递失败」而不是契约错误。本插件已正确传入
+  （`lib/index.js` 的 `queueFollowupMessage`：`const receipt = await subagents.prompt(payload, signal);`），
+  冒烟脚本也会校验该实参形状（见下节）。
 
 ## 本地验证（冒烟脚本）
 
@@ -359,13 +370,30 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 27 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 36 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
 投递、收尾宽限用尽第二次中断（硬停）、自行 settle 的子代理不被中断、宿主缺 `interrupt` /
 父代理缺失时只告警、以及 `GET /dsh-code-pipeline/status` 的 `budgetMinutes` / `timedOut` /
 `longestRunningMs` 字段、以及**续跑的计时口径**（运行中插话不重置、原预算按时到期、续跑重新起算并按新预算到期、settle 后续跑也重新起算）。
+
+0.1.19 起这个脚本还**校验宿主调用的实参形状**——假 `startContinuable(spec)` 要求
+`spec.signal instanceof AbortSignal` 且 `spec.request.prompt[0].type === 'text'`；假
+`prompt(payload, signal)` 与假 `sendMessage(_parent, childId, content, options)` 都要求 signal 存在
+（宿主对它们调用 `signal.throwIfAborted()`），形状不符即抛出与宿主同形的 `TypeError` ——
+把「漏传尾部 transport 实参」从静默失败变成脚本变红。新增断言：
+**`followupMode: 'queue'` 的 `pipeline_followup` 全路径**（走 `subagents.prompt`，成功返回 +
+回执 `messageId` 透出 + 载荷 `mode: 'continuable'` / `delivery: 'queue'`）、
+**探测表只成功调用一次**（首项即被接受，无第 2 次尝试）、
+**探测表回退的尝试序列**（两种已知形状都被 `gateway/bad-request` 拒绝时，尝试序列恰为
+`[continuable + delivery, continuable]`——已删除的第三项 `mode: 'queue'` 不被尝试；
+断言读的是假 `prompt` 在**判定接受之前**记下的载荷流水。计数断言只能拦住更长的探测表
+（把第三项加回来就会多出一次尝试），序列断言额外钉住每次尝试的**形状**——回退项必须是不带
+`delivery` 的 `continuable`（只改形状、例如给第二项加 `delivery: 'steer'`，计数仍是 2，
+计数断言察觉不到，形状只能靠序列断言拦住）、
+**宿主改写文案时仍能回退**（`message` 不再以 `invalid payload for subagent.prompt` 开头、
+但 `details.issues` 仍在 → OR 兜底照常继续探测并成功投递）。
 
 ## 计划的工作流切分（Workstreams）与并行 impl
 
@@ -386,6 +414,48 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.1.19（宿主事实核对：文案口径修正 + 探测表清理 + 测试加固）**：
+  - **`run_code` 墙钟口径改正**：库内注释、`run_in_background: false` 的拒绝错误串、预设 persona
+    与 README 原先都写成「20 分钟」级别的上限——原文分别是 `lib/index.js` 的「run_code 有 20 分钟」/
+    「run_code is capped at a 20-minute wall clock」、`README.md` 的「`run_code` 程序有 20 分钟
+    wall-clock 上限」、预设的「a 20-minute wall-clock ceiling」；本轮已按实际改正为 120 s/600 s
+    （见下），原先的写法与宿主源码不符——`ptc-runtime-node` 的 `Config` 是
+    `timeoutMs: z.number().default(120_000)` / `maxTimeoutMs: z.number().default(600_000)`
+    （`packages/ptc-runtime/ptc-runtime-node/src/index.ts:54-56`），且 `packages/bundle/base/cordis.patch.yml`
+    的 `ptc-runtime` 行不带 `config`（`:369-370`），所以实际是**默认 120 s、上限 600 s**，
+    传 `run_code` 的 `timeoutMs` 可顶到上限；全仓不存在该量级的常量。四处文案统一改为事实口径。
+  - **删除死探测分支**：`queueFollowupMessage` 的载荷探测表第 3 项 `mode: 'queue'` 永不可达
+    ——宿主 `subagent.prompt` 的 control schema 是 `mode: z.literal('continuable')`（`delivery`
+    自 0.1.3-alpha.2 起必填），
+    见 `packages/subagent/subagent/src/control.ts:20-25`。探测表只剩两项：带 `delivery` 的当前形状
+    → 不带 `delivery` 的旧形状。
+  - **放宽宿主错误文案判别**：`isBadPayload` 由整句 `message === "invalid payload for subagent.prompt"`
+    改为**两个条件取 OR**：`message.startsWith("invalid payload for subagent.prompt")` **或**
+    `Array.isArray(details.issues)`，命中任一即继续探测下一形状。宿主文案由 `control.ts:46` 的
+    `invalid payload for ${method}` 模板生成，改文案不再让探测静默失效；兜底读的是
+    `RemoteError.details.issues`（`RemoteError` 第三个构造参数即 `readonly details`，
+    `packages/typert/protocol/src/remote-error.ts:22-30`）。注意必须是 OR：`RemoteError` 继承
+    `Error`、`message` 恒为字符串，所以早期写过的三元形式（"message 是字符串就查前缀、
+    否则才看 issues"）里 issues 那一支**永不可达**（死代码），宿主一改文案探测就放弃回退——
+    这正是 OR 兜底要修掉的行为。
+  - **测试加固**：假 ctx 现在校验宿主调用的实参形状（`startContinuable` 的 `spec.signal` /
+    `spec.request.prompt`、`prompt` 的尾参 `signal`、`sendMessage` 的 `options.signal`），
+     并新增 queue 投递路径、探测表次数与**探测表尝试序列**的断言（27 → 36 项）：
+    假 `prompt` 在判定接受之前记录每次尝试的载荷，因此可以断言"两种已知形状都被拒时
+    尝试序列恰为 `[continuable+delivery, continuable]`、没有任何 `mode === 'queue'`"
+    （次数断言拦住更长的探测表，序列断言额外钉住回退项的形状：第二项必须是不带
+    `delivery` 的 `continuable`），以及
+    "宿主改写文案但保留 `details.issues` 时仍然回退成功"（OR 兜底的行为覆盖）。
+  - **`engines.dsh` 提升**为 `>=0.1.6-alpha.1`：真正把下限推到 0.1.6-alpha.1 的只有
+    `workflow-ptc` **行名**（该行由提交 `35af8698c2` 引入，最早包含它的 tag 是
+    `dsh-v0.1.6-alpha.1`）。`subagents.prompt` 的 `delivery` 必填自 0.1.3-alpha.2 起
+    （提交 `96ead6091d`），`signal` 尾参自 `dsh-v0.1.2-alpha.1` / `dsh-v0.1.2-rc.1` 起就
+    要求调用方显式传入（提交 `377f3b4f1d`）——这两条都**不是**本次抬下限的原因，
+    旧下限 `>=0.1.2-rc.1` 在这一点上并不不实。
+  - **如实记录一次误报（避免后人重踩）**：本轮调研曾上报「`subagents.prompt` 缺 `signal` 尾参、
+    queue 投递必然失败」，经复核**已撤回**。成因是读取宿主源码时把行截断后按残文推导实参个数。
+    实际插件一直是 `const receipt = await subagents.prompt(payload, signal);`（两个实参齐全），
+    queue 投递与墙钟收尾投递路径经完整核对**没有缺陷**。教训：**不要用被截断的源码行判定实参个数**。
 - **0.1.18（适配 dsh 0.1.6-alpha.1：工作流引擎改名 workflow-ptc）**：
   - **症状**：升级后预设挂载失败 —— `row "workflow-worker-thread" names a plugin that cannot be
     resolved: @deepseek-ai/dsh-workflow-worker-thread`，resume 会话直接 `RemoteError ... (gateway/internal)`。

@@ -141,9 +141,10 @@
       no separate history tool; a stage must put its full result in that reply. `run_in_background: false` is
       REJECTED — never wait for a stage inside the current turn.
 
-      Why always: the `run_code` program that would wait for a stage is capped by
-      a 20-minute wall-clock ceiling, so a foreground wait is cut off (and the child
-      cancelled) for anything longer. Keep the flow coherent: never dispatch the
+      Why always: the `run_code` program that would wait for a stage has a wall clock
+      that defaults to 120 s and is capped at 600 s (pass `timeoutMs` to reach the cap),
+      so a foreground wait is cut off (and the child cancelled) for anything longer.
+      Keep the flow coherent: never dispatch the
       impl stage until the plan (or its revision) is in hand, and a settled notice
       is the finished stage output.
 
