@@ -41,7 +41,13 @@ globalThis.setInterval = (fn) => { sweep = fn; return { unref() {} }; };
 globalThis.clearInterval = () => {};
 
 // ── 假 ctx ──────────────────────────────────────────────────────────────────
-function createHarness() {
+// parentId 可指定：创建数量台账是模块级、按父会话隔离的，扩展场景各自用独立父会话，
+// 才不会与前一个场景已创建的阶段子代理互相污染；childId 带 harness 序号以保证全局
+// 唯一（dispatched 是按 childId 索引的模块级 Map，跨场景重名会互相覆盖）。
+let harnessSeq = 0;
+function createHarness(parentId = 'parent-1') {
+  harnessSeq += 1;
+  const harnessNo = harnessSeq;
   const handlers = new Map();
   const tools = new Map();
   const routes = new Map();
@@ -54,26 +60,55 @@ function createHarness() {
   // 宿主调用记账：实参形状与调用次数（宿主契约回归——漏传 signal 会让脚本变红）。
   // promptPayloads 在"判定接受之前"记录每次尝试的载荷：探测表的尝试序列因此可断言
   // （光看 queued[last] 看不出中间试过哪些形状）。
-  const calls = { prompt: 0, promptPayloads: [], promptSignals: [], startSignals: [], sendMessageOptions: [], rejectDelivery: false, rejectKnownShapes: false, rewriteBadPayloadMessage: false };
+  const calls = { prompt: 0, promptPayloads: [], promptSignals: [], startSignals: [], sendMessageOptions: [], rejectDelivery: false, rejectKnownShapes: false, rewriteBadPayloadMessage: false,
+    // 创建上限 / 压缩顺序断言的记账：
+    //   start          —— 宿主创建入口 startContinuable 的真实调用次数（证明闸门是代码拦的）；
+    //   order          —— 跨服务统一调用序列（压缩必须早于投递）；
+    //   serviceForArgs —— agentPresets.serviceFor 的实参（realm 私有 compression 服务寻址）；
+    //   compactNowArgs —— compactNow 的实参（第一个实参必须是目标子代理对象）。
+    start: 0, order: [], serviceForArgs: [], compactNowArgs: [] };
   let childSeq = 0;
 
   const toolsRegistry = { register: (def) => tools.set(def.name, def) };
+  // 非本预设的 root（P4）：status 不得对它们调用 listChildren（N+1）。
+  const foreignRoots = [];
+  // 预设门面：composedPreset 供注入/资格守卫（对 foreignRoots 返回别的预设名）；
+  // serviceFor 供压缩寻址——测试可整体替换（模拟「realm 私有服务不可达」）。
+  const presets = {
+    composedPreset: (agentCtx) => (foreignRoots.some((root) => root.ctx === agentCtx) ? 'standard' : 'code-pipeline'),
+    serviceFor: undefined,
+  };
   const parent = {
-    id: 'parent-1',
+    id: parentId,
     ctx: {
       get: (name) => name === 'tools'
         ? toolsRegistry
         : name === 'agentPresets'
-          ? { composedPreset: () => 'code-pipeline' }
+          ? presets
           : undefined,
     },
   };
 
   const webServer = { register: ({ path, handler }) => routes.set(path, handler) };
+  // 活着的子代理对象（agents.get）：压缩只对「本进程已唤醒」的子代理可行。测试用
+  // childAgents.set(id, agent) 造出活对象，用 options.stageKey 造出阶段归属。
+  const childAgents = new Map();
   const agentsService = {
-    roots: () => [parent],
+    roots: () => [parent, ...foreignRoots],
     isOwnedBy: () => false,
-    get: (id) => (id === parent.id ? parent : undefined),
+    get: (id) => (id === parent.id ? parent : childAgents.get(id)),
+  };
+  // 宿主 subagents 持久面（listChildren）的可控假实现——扩展场景需要模拟：
+  //   fail           —— 枚举瞬时抛错（P3：绝不能当成「持久面为空」而放行）；
+  //   hold           —— 枚举挂起（P5：把调用卡在「已预留、尚未创建」的窗口里）；
+  //   rows / rowsFor —— 只返回持久行（「重启」形状：台账为空、持久面有行；P1/P2/P3）；
+  //   calls          —— 每次枚举的 parentId 实参（P4：不得对非本预设 root 做 N+1）。
+  const host = { fail: false, hold: null, rows: null, rowsFor: null, calls: [] };
+  /** 造一个「非本预设」的 root（composedPreset 对它返回 standard），用于 P4。 */
+  const addForeignRoot = (id) => {
+    const root = { id, ctx: { get: () => undefined } };
+    foreignRoots.push(root);
+    return root;
   };
   const subagents = {
     getProvider: (name) => ({ name }),
@@ -88,12 +123,23 @@ function createHarness() {
         throw new TypeError('subagent start request carries no text prompt');
       }
       calls.startSignals.push(spec.signal);
+      calls.start += 1;
+      calls.order.push('startContinuable');
       childSeq += 1;
-      const childId = 'child-' + childSeq;
-      children.set(childId, { activity: 'running' });
+      const childId = 'child-' + harnessNo + '-' + childSeq;
+      // 宿主把 descriptor.label 原样写进持久面（listChildren.label）：假宿主照做，
+      // 「`<stage>/` 前缀的持久行也能归属阶段」这条才可断言。
+      children.set(childId, { activity: 'running', label: spec.label });
       return { childId, messageId: 'msg-0' };
     },
-    listChildren: async () => [...children.entries()].map(([id, row]) => ({ kind: 'child', id, activity: row.activity })),
+    listChildren: async (id) => {
+      host.calls.push(String(id ?? ''));
+      if (host.fail) throw new Error('subagent listing unavailable (simulated transient store failure)');
+      if (host.hold !== null) await host.hold;
+      if (typeof host.rowsFor === 'function') return host.rowsFor(String(id ?? ''));
+      if (host.rows !== null) return host.rows;
+      return [...children.entries()].map(([childId, row]) => ({ kind: 'child', id: childId, activity: row.activity, label: row.label }));
+    },
     interrupt: (id, authority) => {
       interrupts.push({ id, authority });
       const row = children.get(id);
@@ -101,6 +147,7 @@ function createHarness() {
     },
     prompt: async (payload, signal) => {
       calls.prompt += 1;
+      calls.order.push('prompt');
       // 宿主 continuation-activation.ts:489 对 signal 做 signal.throwIfAborted()：
       // 漏传尾部 transport 实参在这里必然 TypeError。
       if (!(signal instanceof AbortSignal)) {
@@ -136,6 +183,7 @@ function createHarness() {
         throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
       }
       calls.sendMessageOptions.push(options);
+      calls.order.push('sendMessage');
       steers.push({ childId, text: String(content?.[0]?.text ?? '') });
       return 'msg-2';
     },
@@ -150,7 +198,7 @@ function createHarness() {
       : name === 'agents'
         ? agentsService
         : name === 'agentPresets'
-          ? { composedPreset: () => 'code-pipeline' }
+          ? presets
           : name === 'webServer'
             ? webServer
             : undefined,
@@ -159,7 +207,7 @@ function createHarness() {
 
   return {
     ctx, parent, settings, tools, routes, warnings, interrupts, queued, steers, children,
-    agentsService, subagents, calls,
+    agentsService, subagents, calls, presets, childAgents, parentId, host, addForeignRoot, foreignRoots,
     emit: (name, payload) => { for (const fn of handlers.get(name) ?? []) fn(payload); },
   };
 }
@@ -476,6 +524,737 @@ const shapeOf = (row) => row === undefined
     JSON.stringify(h.queued[h.queued.length - 1] ?? null));
   h.emit('subagent/end', { id: child.subagentId });
   h.settings.followupMode = 'steer';
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 创建数量硬上限 + 压缩后复用 + 别名稳定（机制回归基线）
+// ════════════════════════════════════════════════════════════════════════════
+// 与上面的墙钟场景刻意隔离：创建数量台账是模块级、按父会话隔离、且**只增不减**的，
+// 因此每个新场景都用独立 parentId 的假 ctx（台账互不可见），childId 也全局唯一。
+
+const stageKeys = ['plan', 'impl', 'review'];
+const capStages = (maxConcurrency) => ({
+  plan: { budgetMinutes: 0 },
+  impl: { budgetMinutes: 0, maxConcurrency },
+  review: { budgetMinutes: 0 },
+});
+async function newHarness(parentId, stages) {
+  const harness = createHarness(parentId);
+  await plugin.apply(harness.ctx, { preset: 'code-pipeline' });
+  harness.emit('agent/created', { agent: harness.parent });
+  harness.settings.stages = stages ?? capStages(0);
+  return harness;
+}
+const runStage = (harness, toolName, args = {}) => harness.tools.get(toolName).execute(
+  { prompt: 'do the thing', ...args },
+  { agent: harness.parent, signal: new AbortController().signal },
+);
+const runFollowup = (harness, child, message, compact) => harness.tools.get('pipeline_followup').execute(
+  compact === true ? { child, message, compact: true } : { child, message },
+  { agent: harness.parent, signal: new AbortController().signal },
+);
+const attempt = async (harness, toolName, args = {}) => {
+  try {
+    return { ok: true, result: await runStage(harness, toolName, args) };
+  } catch (error) {
+    return { ok: false, message: String(error?.message ?? error) };
+  }
+};
+const attemptFollowup = async (harness, child, message, compact) => {
+  try {
+    return { ok: true, result: await runFollowup(harness, child, message, compact) };
+  } catch (error) {
+    return { ok: false, message: String(error?.message ?? error) };
+  }
+};
+
+// ── A. 创建数量硬闸门（上限复用 maxConcurrency；数的是「已创建」而不是「在跑」）──
+{
+  const cap = await newHarness('parent-cap-1', capStages(1));
+  const first = await attempt(cap, 'subagent_impl', { description: 'cap test one' });
+  const firstId = first.result?.subagentId;
+  const firstLabel = 'impl/cap test one';
+  check(
+    'A1 创建上限=1：第 1 个同阶段派发成功并返回 durable subagentId',
+    first.ok === true && first.result?.kind === 'continuable' && typeof firstId === 'string',
+    JSON.stringify(first).slice(0, 200),
+  );
+  const second = await attempt(cap, 'subagent_impl', { description: 'cap test two' });
+  check('A1 创建上限=1：第 2 个同阶段派发必抛（是硬闸门，不是劝说）', second.ok === false, JSON.stringify(second).slice(0, 200));
+  check('A1 宿主的创建入口 startContinuable 只被调用 1 次（证明是代码拦下的）', cap.calls.start === 1, 'start ' + cap.calls.start);
+  // 第 2 次派发时第 1 个还在跑：先撞上的是「运行上限」闸门（两道闸门同级，先运行后创建）。
+  // 它同样是策略拒绝而不是阶段不可用，且必须带复用出路（否则主代理会终止整个任务）。
+  check(
+    'A1 第 2 次派发被运行上限闸门拦下（stage concurrency limit reached，实际措辞）',
+    /stage concurrency limit reached/i.test(second.message ?? ''),
+    (second.message ?? '').slice(0, 160),
+  );
+  check(
+    'A1 运行上限拒绝文案明确「不是阶段失败、不要停任务」且不带 UNAVAILABLE 指引横幅',
+    (second.message ?? '').includes('NOT a stage failure')
+      && !(second.message ?? '').includes('Pipeline stage UNAVAILABLE'),
+    (second.message ?? '').slice(0, 200),
+  );
+
+  // 结束第 1 个（subagent/end 撤销运行账本 + 宿主行改 inactive，running 归零）后仍被拒：
+  // 这一次运行闸门放行，撞上的是**创建上限**闸门 —— 它数的才是「已创建」。
+  cap.emit('subagent/end', { id: firstId });
+  cap.children.set(firstId, { activity: 'idle', label: firstLabel });
+  const third = await attempt(cap, 'subagent_impl', { description: 'cap test three' });
+  const creationMessage = third.message ?? '';
+  check(
+    'A3 子代理结束、running 归零后第 3 次派发仍被拒（数的是「已创建」而不是「在跑」）',
+    third.ok === false,
+    JSON.stringify(third).slice(0, 200),
+  );
+  check(
+    'A3 这次撞上的是创建上限闸门（实际措辞：stage CREATION limit reached）',
+    /stage CREATION limit reached/i.test(creationMessage),
+    creationMessage.slice(0, 160),
+  );
+  check('A3 创建上限文案说明「等 settle 不腾名额、只有复用才行」', creationMessage.includes('does NOT free a slot'), creationMessage.slice(0, 300));
+  check('A3 宿主的创建入口依旧只被调用 1 次（第 3 次没有真的创建）', cap.calls.start === 1, 'start ' + cap.calls.start);
+
+  // A2 文案契约：作用在「创建上限」那条错误上 —— 只有它携带可复用清单与 compact 出路。
+  check('A2 创建上限文案带第 1 个子代理的 id', creationMessage.includes(firstId), firstId);
+  check('A2 创建上限文案带它的 label（含阶段前缀）', creationMessage.includes(firstLabel), firstLabel);
+  check('A2 创建上限文案给出 pipeline_followup 复用出路', creationMessage.includes('pipeline_followup'));
+  check('A2 创建上限文案给出「有干扰时 compact: true」出路', creationMessage.includes('compact: true'));
+  check(
+    'A2 创建上限文案列出的可复用清单带 id + label + 活动状态',
+    creationMessage.includes(firstId + '  "' + firstLabel + '"') && (creationMessage.includes('[running]') || creationMessage.includes('[inactive]')),
+    creationMessage.slice(0, 400),
+  );
+  check(
+    'A2 创建上限文案不带 UNAVAILABLE 指引横幅（UNAVAILABLE 只以「不要报它」的否定形式出现）',
+    !creationMessage.includes('Pipeline stage UNAVAILABLE') && !creationMessage.includes('STOP and report to the user'),
+    creationMessage.slice(0, 160),
+  );
+}
+
+// A4 上限 0 = 不限制（零回归）
+{
+  const zero = await newHarness('parent-cap-0', capStages(0));
+  const results = [];
+  for (let i = 0; i < 3; i += 1) results.push(await attempt(zero, 'subagent_impl', { description: 'unlimited ' + i }));
+  check('A4 maxConcurrency=0：连派 3 个同阶段子代理全部成功', results.every((row) => row.ok === true), JSON.stringify(results.map((row) => row.ok)));
+  check('A4 上限 0 = 不限制：宿主创建入口被调用 3 次', zero.calls.start === 3, 'start ' + zero.calls.start);
+}
+
+// A5 并发竞态：同一个程序里 Promise.all 三个（cap=1）→ 同步预留只放行 1 个
+{
+  const race = await newHarness('parent-cap-race', capStages(1));
+  const settled = await Promise.all([
+    attempt(race, 'subagent_impl', { description: 'race a' }),
+    attempt(race, 'subagent_impl', { description: 'race b' }),
+    attempt(race, 'subagent_impl', { description: 'race c' }),
+  ]);
+  const passed = settled.filter((row) => row.ok === true);
+  const refused = settled.filter((row) => row.ok === false);
+  check('A5 并发竞态（cap=1、Promise.all 三个）：只放行 1 个', passed.length === 1, JSON.stringify(settled.map((row) => row.ok)));
+  check('A5 并发竞态：宿主创建入口只被调用 1 次（同步预留生效）', race.calls.start === 1, 'start ' + race.calls.start);
+  check(
+    'A5 被拒的两个都是阶段上限拒绝（运行上限或创建上限），不是别的失败',
+    refused.length === 2 && refused.every((row) => /concurrency limit reached|CREATION limit reached/.test(row.message ?? '')),
+    JSON.stringify(refused.map((row) => (row.message ?? '').slice(0, 90))),
+  );
+}
+
+// A6 重启持久面：只靠宿主 listChildren 里带阶段前缀 label 的行也能判定已达上限
+{
+  const persist = await newHarness('parent-persist', capStages(1));
+  persist.children.set('orphan-impl-1', { activity: 'inactive', label: 'impl/orphan from a previous process' });
+  const blocked = await attempt(persist, 'subagent_impl', { description: 'after restart' });
+  check(
+    'A6 台账里没有、仅靠宿主持久行的 <stage>/ 前缀 label 就让 impl 判定已达上限并被拒',
+    blocked.ok === false && /stage CREATION limit reached/i.test(blocked.message ?? ''),
+    JSON.stringify(blocked).slice(0, 220),
+  );
+  check('A6 拒绝文案把这条持久行列为可复用（id + 持久 label）',
+    (blocked.message ?? '').includes('orphan-impl-1') && (blocked.message ?? '').includes('impl/orphan from a previous process'));
+  check('A6 该路径没有调用宿主创建入口', persist.calls.start === 0, 'start ' + persist.calls.start);
+  // 对照：无阶段前缀的行不归属任何阶段 —— plan 阶段照常派发。
+  persist.children.set('orphan-nolabel-1', { activity: 'running', label: 'unrelated child' });
+  const planOk = await attempt(persist, 'subagent_plan', { description: 'plan still works' });
+  check('A6 对照：无阶段前缀的持久行不参与阶段计数（plan 照常派发成功）', planOk.ok === true, JSON.stringify(planOk).slice(0, 180));
+
+  // 归属优先级第二级：活 agent 的 options.stageKey（label 无前缀也认）
+  const warm = await newHarness('parent-warm', capStages(1));
+  warm.childAgents.set('warm-impl-1', { id: 'warm-impl-1', options: { stageKey: 'impl' } });
+  warm.children.set('warm-impl-1', { activity: 'running', label: 'no stage prefix here' });
+  const warmBlocked = await attempt(warm, 'subagent_impl', { description: 'stageKey attribution' });
+  check(
+    'A6 归属优先级：活 agent 的 options.stageKey 也能识别阶段（label 无前缀照样计数）',
+    warmBlocked.ok === false && (warmBlocked.message ?? '').includes('warm-impl-1'),
+    JSON.stringify(warmBlocked).slice(0, 220),
+  );
+  check('A6 stageKey 归属路径同样没有调用宿主创建入口', warm.calls.start === 0, 'start ' + warm.calls.start);
+}
+
+// ── B. 压缩后复用（compact: true）：顺序硬约束 + 失败路径一律不投递 ─────────────
+{
+  const cp = await newHarness('parent-compact', capStages(0));
+  const child = await runStage(cp, 'subagent_impl', { description: 'compact target' });
+  const childId = child.subagentId;
+  const live = { id: childId, options: { stageKey: 'impl' } };
+  cp.childAgents.set(childId, live);
+  cp.presets.serviceFor = (agent, serviceName) => {
+    cp.calls.serviceForArgs.push({ agent, serviceName });
+    return serviceName === 'compaction' ? cp.compaction : undefined;
+  };
+  const orderIndex = (name) => cp.calls.order.indexOf(name);
+
+  // B7 成功路径
+  cp.compaction = {
+    compactNow: async (childAgent, signal) => {
+      cp.calls.order.push('compactNow');
+      cp.calls.compactNowArgs.push({ childAgent, signal });
+      return { summary: 'compacted' };
+    },
+  };
+  cp.calls.order.length = 0;
+  const beforeCompact = cp.steers.length;
+  const compacted = await attemptFollowup(cp, childId, 'reuse with compaction', true);
+  check(
+    'B7 compact:true 成功路径：compacted 置 true 且消息真的投递了',
+    compacted.ok === true && compacted.result?.compacted === true && cp.steers.length === beforeCompact + 1,
+    JSON.stringify(compacted).slice(0, 240),
+  );
+  check(
+    'B7 压缩服务走 agentPresets.serviceFor(child, "compaction")（preset realm 私有实例）',
+    cp.calls.serviceForArgs.some((row) => row.serviceName === 'compaction' && row.agent === live),
+    JSON.stringify(cp.calls.serviceForArgs.map((row) => row.serviceName)),
+  );
+  check(
+    'B7 compactNow 的第一个实参就是目标子代理对象，第二个是 AbortSignal',
+    cp.calls.compactNowArgs[0]?.childAgent === live && cp.calls.compactNowArgs[0]?.signal instanceof AbortSignal,
+    String(cp.calls.compactNowArgs[0]?.childAgent?.id),
+  );
+  check(
+    'B7 顺序硬约束：compactNow 早于投递（sendMessage）',
+    orderIndex('compactNow') >= 0 && orderIndex('sendMessage') >= 0 && orderIndex('compactNow') < orderIndex('sendMessage'),
+    JSON.stringify(cp.calls.order),
+  );
+  check(
+    'B7 恰好一次压缩 + 恰好一次投递（没有重复投递）',
+    cp.calls.order.filter((name) => name === 'compactNow').length === 1 && cp.calls.order.filter((name) => name === 'sendMessage').length === 1,
+    JSON.stringify(cp.calls.order),
+  );
+
+  // B8 compactNow 返回 null：没有可压区间，不算失败，投递照常，compacted 不置 true
+  cp.compaction = { compactNow: async () => { cp.calls.order.push('compactNow'); return null; } };
+  cp.calls.order.length = 0;
+  const beforeNull = cp.steers.length;
+  const nullResult = await attemptFollowup(cp, childId, 'null compaction', true);
+  check(
+    'B8 compactNow 返回 null：不抛错、compacted 不置 true',
+    nullResult.ok === true && nullResult.result?.compacted === undefined,
+    JSON.stringify(nullResult).slice(0, 240),
+  );
+  check(
+    'B8 compactNow 返回 null：投递照常发生',
+    cp.steers.length === beforeNull + 1 && cp.calls.order.includes('sendMessage'),
+    JSON.stringify(cp.calls.order),
+  );
+
+  // B9 压缩失败（ManualCompactionError 的 busy / summary）：抛错 + 一次都没投递
+  for (const code of ['busy', 'summary']) {
+    cp.compaction = {
+      compactNow: async () => {
+        const error = new Error('manual compaction refused: ' + code);
+        error.code = code;
+        throw error;
+      },
+    };
+    const beforeSends = cp.calls.sendMessageOptions.length;
+    const beforePrompts = cp.calls.prompt;
+    const failed = await attemptFollowup(cp, childId, 'compaction fails ' + code, true);
+    check(
+      'B9 compactNow 抛 ' + code + '：抛错且文案含失败码与「什么都没投递」',
+      failed.ok === false && (failed.message ?? '').includes(code) && (failed.message ?? '').includes('Nothing was delivered to the child'),
+      JSON.stringify(failed).slice(0, 260),
+    );
+    check(
+      'B9 compactNow 抛 ' + code + '：投递一次都没发生（steer 与 queue 两条通道都没动）',
+      cp.calls.sendMessageOptions.length === beforeSends && cp.calls.prompt === beforePrompts,
+      'sendMessage +' + (cp.calls.sendMessageOptions.length - beforeSends) + ' / prompt +' + (cp.calls.prompt - beforePrompts),
+    );
+  }
+
+  // B10 服务寻址失败：serviceFor 返回 undefined / 返回没有 compactNow 的对象
+  const beforeNoService = cp.calls.sendMessageOptions.length;
+  cp.presets.serviceFor = () => undefined;
+  const noService = await attemptFollowup(cp, childId, 'no compaction service', true);
+  check(
+    'B10 serviceFor 返回 undefined：明确错误（compactNow 不可达）且未投递',
+    noService.ok === false && (noService.message ?? '').includes('compactNow')
+      && (noService.message ?? '').includes('compact: false')
+      && (noService.message ?? '').includes('Nothing was delivered'),
+    JSON.stringify(noService).slice(0, 260),
+  );
+  check('B10 serviceFor 返回 undefined：投递次数不变', cp.calls.sendMessageOptions.length === beforeNoService);
+  cp.presets.serviceFor = (agent, serviceName) => (serviceName === 'compaction' ? {} : undefined);
+  const emptyService = await attemptFollowup(cp, childId, 'empty compaction service', true);
+  check(
+    'B10 serviceFor 返回没有 compactNow 的对象：同样明确拒绝且未投递',
+    emptyService.ok === false && (emptyService.message ?? '').includes('compactNow')
+      && cp.calls.sendMessageOptions.length === beforeNoService,
+    JSON.stringify(emptyService).slice(0, 260),
+  );
+
+  // B11 目标子代理不在 agents.get 里（冷子代理）：明确错误 + 未投递
+  const cold = await runStage(cp, 'subagent_impl', { description: 'cold child' });
+  cp.presets.serviceFor = (agent, serviceName) => (serviceName === 'compaction' ? cp.compaction : undefined);
+  cp.compaction = { compactNow: async () => { cp.calls.order.push('compactNow'); return {}; } };
+  cp.calls.order.length = 0;
+  const beforeCold = cp.calls.sendMessageOptions.length;
+  const coldResult = await attemptFollowup(cp, cold.subagentId, 'compact a cold child', true);
+  check(
+    'B11 冷子代理（agents.get 拿不到）无法压缩：明确错误 + 未投递',
+    coldResult.ok === false
+      && (coldResult.message ?? '').includes('cold subagent')
+      && (coldResult.message ?? '').includes('Nothing was delivered')
+      && cp.calls.sendMessageOptions.length === beforeCold,
+    JSON.stringify(coldResult).slice(0, 260),
+  );
+  check('B11 冷子代理的错误提示先做一次 compact:false 的普通复用唤醒', (coldResult.message ?? '').includes('compact: false'));
+  check('B11 冷子代理路径根本没有调用 compactNow', !cp.calls.order.includes('compactNow'), JSON.stringify(cp.calls.order));
+}
+
+// ── C. 别名解析按 seq 稳定：rearmStageBudget 改写 entry.at 之后不漂移 ──────────
+{
+  const al = await newHarness('parent-alias', capStages(0));
+  const implA = await runStage(al, 'subagent_impl', { description: 'alias first' });
+  const implB = await runStage(al, 'subagent_impl', { description: 'alias second' });
+  const baseline = await attemptFollowup(al, 'impl', 'baseline alias resolution');
+  check(
+    'C12 前置：两个 impl 都在台账里，child:"impl" 指向最近派发的那个（seq 最大）',
+    baseline.ok === true && baseline.result?.childId === implB.subagentId,
+    JSON.stringify(baseline).slice(0, 200) + ' expected ' + implB.subagentId,
+  );
+  al.emit('subagent/end', { id: implA.subagentId });
+  al.children.set(implA.subagentId, { activity: 'idle', label: 'impl/alias first' });
+  advance(10 * MINUTE); // 让 rearm 后的 entry.at 明确晚于 implB 的派发时刻
+  const rearmed = await attemptFollowup(al, implA.subagentId, 'round 2 on the first impl');
+  check(
+    'C12 前置：精确 id 续跑已停下的 impl 触发墙钟重新起算（entry.at 被改写）',
+    rearmed.ok === true && rearmed.result?.wallClockRearmed === true && rearmed.result?.childId === implA.subagentId,
+    JSON.stringify(rearmed).slice(0, 200),
+  );
+  const byAlias = await attemptFollowup(al, 'impl', 'alias after rearm');
+  check(
+    'C12 rearm 改写 at 之后 child:"impl" 仍指向同一子代理（不漂移到被 rearm 的那个）',
+    byAlias.ok === true && byAlias.result?.childId === implB.subagentId,
+    JSON.stringify(byAlias).slice(0, 200) + ' expected ' + implB.subagentId + ' (implA=' + implA.subagentId + ')',
+  );
+  const byLatest = await attemptFollowup(al, 'latest', 'latest after rearm');
+  check(
+    'C12 child:"latest" 同样按 seq 取最近派发（不受 rearm 影响）',
+    byLatest.ok === true && byLatest.result?.childId === implB.subagentId,
+    JSON.stringify(byLatest).slice(0, 200) + ' expected ' + implB.subagentId,
+  );
+  check(
+    'C12 被 rearm 的子代理自身仍可用精确 id 命中（别名与精确 id 两条路都在）',
+    (byAlias.result?.childId !== implA.subagentId) && (byLatest.result?.childId !== implA.subagentId),
+  );
+}
+
+// ── D. status 新字段 + 阶段描述指引（补充证据）────────────────────────────────
+{
+  const stages = await statusOf();
+  check(
+    'D13 status 每阶段含 created（number）',
+    stageKeys.every((key) => typeof stages[key]?.created === 'number'),
+    JSON.stringify(stageKeys.map((key) => [key, stages[key]?.created])),
+  );
+  check(
+    'D13 status 每阶段含 available（数组，元素带 id / label / activity）',
+    stageKeys.every((key) => Array.isArray(stages[key]?.available)
+      && stages[key].available.every((row) => typeof row.id === 'string' && row.id.length > 0
+        && typeof row.label === 'string' && row.label.length > 0
+        && (row.activity === 'running' || row.activity === 'inactive'))),
+    JSON.stringify(stages.impl?.available?.slice(0, 3) ?? null),
+  );
+  check(
+    'D13 created 与 available.length 一致（created 就是可复用清单的长度）',
+    stageKeys.every((key) => stages[key]?.created === stages[key]?.available?.length),
+    JSON.stringify(stageKeys.map((key) => [stages[key]?.created, stages[key]?.available?.length])),
+  );
+  check(
+    'D13 available 列出本进程派发过的阶段子代理，label 带 <stage>/ 前缀',
+    stageKeys.every((key) => (stages[key]?.available ?? []).some((row) => row.label.startsWith(key + '/'))),
+    JSON.stringify(stageKeys.map((key) => (stages[key]?.available ?? []).map((row) => row.label).slice(0, 3))),
+  );
+  check(
+    'D15 三条阶段描述都写明创建上限 + compact 复用指引 + pipeline_followup',
+    stageKeys.every((key) => {
+      const text = String(h.tools.get('subagent_' + key)?.description ?? '');
+      return text.includes('CREATION CAP') && text.includes('compact: true') && text.includes('pipeline_followup');
+    }),
+    JSON.stringify(stageKeys.map((key) => String(h.tools.get('subagent_' + key)?.description ?? '').includes('CREATION CAP'))),
+  );
+  check(
+    'D15 三条阶段描述都说明「settle 不腾创建名额」',
+    stageKeys.every((key) => String(h.tools.get('subagent_' + key)?.description ?? '').includes('does NOT free a creation slot')),
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// P1–P6：重启后寻址 / label 阶段前缀 / 枚举瞬时失败 / status N+1 / 运行上限文案
+// ════════════════════════════════════════════════════════════════════════════
+// 与前面所有场景同样按 parentId 隔离（模块级台账 + createdObservation 高水位都是
+// 按父会话分键的），每个 harness 实例各自持有一份可控的宿主持久面（harness.host）。
+
+const capFor = (caps) => ({
+  plan: { budgetMinutes: 0, ...(caps.plan === undefined ? {} : { maxConcurrency: caps.plan }) },
+  impl: { budgetMinutes: 0, ...(caps.impl === undefined ? {} : { maxConcurrency: caps.impl }) },
+  review: { budgetMinutes: 0, ...(caps.review === undefined ? {} : { maxConcurrency: caps.review }) },
+});
+/** 宿主持久行（listChildren 的形状：只有 id / label / activity）。 */
+const persistRows = (rows) => rows.map(([id, label, activity = 'idle']) => ({ kind: 'child', id, activity, label }));
+const statusOfHarness = async (harness) => {
+  const { res, captured } = captureResponse();
+  await harness.routes.get('/dsh-code-pipeline/status')({}, res);
+  return JSON.parse(captured.body).stages;
+};
+/** 从「创建上限拒绝」文案里抽出可复用清单的 id（走文案而不是硬编码常量）。 */
+const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^"]*"\s+\[(?:running|inactive)\]/g)].map((match) => match[1]);
+
+// ── P1. 重启后寻址：上限看得见 + 寻址也看得见（修前：不能复用也不能新建 = 阶段卡死）──
+{
+  const p1 = await newHarness('parent-p1', capFor({ impl: 1 }));
+  p1.host.rows = persistRows([['persisted-impl-1', 'impl/pre-restart work']]);
+  const blocked = await attempt(p1, 'subagent_impl', { description: 'new work after restart' });
+  check(
+    'P1 重启后创建上限仍生效（空台账 + 持久面已有 1 个 impl → 新派发被拒）',
+    blocked.ok === false && /stage CREATION limit reached/i.test(blocked.message ?? ''),
+    JSON.stringify(blocked).slice(0, 240),
+  );
+  check('P1 被拒时没有发生创建（宿主创建入口 0 次）', p1.calls.start === 0, 'start ' + p1.calls.start);
+  const listed = listedIds(blocked.message);
+  check('P1 拒绝文案给出的可复用 id 就是持久面那一行', listed.includes('persisted-impl-1'), JSON.stringify(listed));
+  // 端到端一环：把拒绝文案里给出的 id 原样拿去做 followup —— 修前这里报 no stage subagent matches。
+  const recovered = await attemptFollowup(p1, listed[0], 'continue the pre-restart work');
+  check('P1 用拒绝文案里的 id 复用成功（修前：no match → 既不能复用也不能新建 = 卡死）',
+    recovered.ok === true, JSON.stringify(recovered).slice(0, 260));
+  check(
+    'P1 消息真的投递到了那个持久面子代理（投递实参 = 该 id）',
+    p1.steers.length === 1 && p1.steers[0].childId === 'persisted-impl-1'
+      && p1.steers[0].text === 'continue the pre-restart work',
+    JSON.stringify(p1.steers),
+  );
+  check(
+    'P1 回执：recovered=true、stage 由持久面补齐为 impl、childId 命中该行',
+    recovered.result?.recovered === true && recovered.result?.stage === 'impl'
+      && recovered.result?.childId === 'persisted-impl-1',
+    JSON.stringify(recovered.result),
+  );
+  check(
+    'P1 回执不谎报 wallClockRearmed（持久面命中无台账条目 → 本轮没有墙钟）',
+    recovered.result?.wallClockRearmed === undefined,
+    JSON.stringify(recovered.result),
+  );
+}
+
+// P1.5 持久面内的阶段别名 / latest / 唯一前缀 / 未命中
+{
+  const p1b = await newHarness('parent-p1b', capFor({}));
+  p1b.host.rows = persistRows([
+    ['persisted-impl-a', 'impl/first durable impl'],
+    ['persisted-review-a', 'review/durable audit'],
+    ['persisted-impl-b', 'impl/second durable impl'],
+  ]);
+  const byAlias = await attemptFollowup(p1b, 'review', 'round 2 of the durable review');
+  check(
+    'P1 持久面里的阶段别名可寻址（child:"review"）',
+    byAlias.ok === true && byAlias.result?.childId === 'persisted-review-a'
+      && byAlias.result?.recovered === true && byAlias.result?.stage === 'review',
+    JSON.stringify(byAlias).slice(0, 240),
+  );
+  const byLatest = await attemptFollowup(p1b, 'latest', 'latest durable target');
+  check(
+    'P1 持久面里的 latest = 宿主列表最后一行（createdAt 升序 = 最近创建）',
+    byLatest.ok === true && byLatest.result?.childId === 'persisted-impl-b' && byLatest.result?.recovered === true,
+    JSON.stringify(byLatest).slice(0, 240),
+  );
+  const byPrefix = await attemptFollowup(p1b, 'persisted-rev', 'addressed by unique prefix');
+  check(
+    'P1 持久面里的唯一前缀也能命中',
+    byPrefix.ok === true && byPrefix.result?.childId === 'persisted-review-a',
+    JSON.stringify(byPrefix).slice(0, 240),
+  );
+  check(
+    'P1 三次持久面命中都真的投递到了对应 id',
+    p1b.steers.map((row) => row.childId).join(',') === 'persisted-review-a,persisted-impl-b,persisted-review-a',
+    JSON.stringify(p1b.steers.map((row) => row.childId)),
+  );
+  const noMatch = await attemptFollowup(p1b, 'persisted-plan-zzz', 'nothing matches this');
+  check(
+    'P1 持久面里也没有的 id → 仍报 no match（不得误命中）',
+    noMatch.ok === false && /no stage subagent matches/.test(noMatch.message ?? ''),
+    JSON.stringify(noMatch).slice(0, 240),
+  );
+  check(
+    'P1 no match 时一次都没有投递',
+    p1b.steers.length === 3 && p1b.calls.sendMessageOptions.length === 3,
+    'steers ' + p1b.steers.length + ' / sendMessage ' + p1b.calls.sendMessageOptions.length,
+  );
+}
+
+// ── P2. stageLabel 只认「当前阶段」前缀：别的阶段前缀不得穿透阶段归属 ─────────────
+{
+  const p2 = await newHarness('parent-p2', capStages(0));
+  const dispatchedChild = await runStage(p2, 'subagent_impl', { description: 'plan/auth refactor' });
+  const durableRows = await p2.subagents.listChildren(p2.parentId);
+  const durableLabel = durableRows.find((row) => row.id === dispatchedChild.subagentId)?.label;
+  check(
+    'P2 impl 派发传 description "plan/auth refactor" → durable label 仍以 impl/ 开头',
+    durableLabel === 'impl/plan/auth refactor',
+    String(durableLabel),
+  );
+  // 「重启」harness：只有这条 durable label 的持久行（id 用持久面合成 id，不在台账里）
+  const p2r = await newHarness('parent-p2r', capFor({ impl: 1, plan: 1 }));
+  p2r.host.rows = persistRows([['persisted-p2-1', durableLabel]]);
+  const implBlocked = await attempt(p2r, 'subagent_impl', { description: 'impl after restart' });
+  check(
+    'P2 重启后该子代理计入 impl（impl 到顶被拒，文案列出它）',
+    implBlocked.ok === false && /stage CREATION limit reached/i.test(implBlocked.message ?? '')
+      && (implBlocked.message ?? '').includes('persisted-p2-1'),
+    JSON.stringify(implBlocked).slice(0, 260),
+  );
+  const planOk = await attempt(p2r, 'subagent_plan', { description: 'plan after restart' });
+  check('P2 同一个子代理不被计进 plan（plan 不被误拒）', planOk.ok === true, JSON.stringify(planOk).slice(0, 200));
+  check('P2 只有 plan 真的被创建（宿主创建入口 1 次，impl 一次都没有）', p2r.calls.start === 1, 'start ' + p2r.calls.start);
+  check(
+    'P2 plan 自己的 durable label 仍是 plan/ 前缀（两个阶段的 label 不互相污染）',
+    p2r.children.get(planOk.result?.subagentId)?.label === 'plan/plan after restart',
+    String(p2r.children.get(planOk.result?.subagentId)?.label),
+  );
+}
+
+// ── P3. 枚举瞬时失败：不得按「持久面为空」放行；区分瞬时失败与宿主没有该能力 ─────────
+{
+  // P3.1 枚举抛错 + 空台账 + limit=1 → 必须被拒
+  const p3 = await newHarness('parent-p3', capFor({ impl: 1 }));
+  p3.host.fail = true;
+  const unverifiable = await attempt(p3, 'subagent_impl', { description: 'enumeration failing' });
+  check(
+    'P3 枚举瞬时抛错 + 空台账 + limit=1 → 派发被拒（不得整体旁路创建上限）',
+    unverifiable.ok === false && /CANNOT BE VERIFIED/.test(unverifiable.message ?? ''),
+    JSON.stringify(unverifiable).slice(0, 280),
+  );
+  check(
+    'P3 该文案声明是瞬时失败 / 可重试，且不带 UNAVAILABLE 指引横幅',
+    (unverifiable.message ?? '').includes('TRANSIENT')
+      && (unverifiable.message ?? '').includes('Retry this dispatch in a LATER step')
+      && !(unverifiable.message ?? '').includes('Pipeline stage UNAVAILABLE')
+      && !(unverifiable.message ?? '').includes('STOP and report to the user'),
+    (unverifiable.message ?? '').slice(0, 240),
+  );
+  check('P3 被拒时没有发生创建', p3.calls.start === 0, 'start ' + p3.calls.start);
+  // P3.2 枚举恢复 → 重试成功（拒绝是瞬时的，不是永久卡死）
+  p3.host.fail = false;
+  const retried = await attempt(p3, 'subagent_impl', { description: 'enumeration recovered' });
+  check(
+    'P3 枚举恢复后重试成功（瞬时拒绝，不是永久卡死）',
+    retried.ok === true && p3.calls.start === 1,
+    JSON.stringify(retried).slice(0, 220) + ' start ' + p3.calls.start,
+  );
+
+  // P3.3 高水位：成功观测一次后枚举抛错 → 仍被拒，且用那次观测的清单兜底
+  const p3b = await newHarness('parent-p3b', capFor({ impl: 1 }));
+  p3b.host.rows = persistRows([['persisted-hw-1', 'impl/high-water row']]);
+  const beforeOutage = await attempt(p3b, 'subagent_impl', { description: 'records the observation' });
+  check(
+    'P3 高水位前置：先成功枚举一次并被拒（清单来自持久面）',
+    beforeOutage.ok === false && (beforeOutage.message ?? '').includes('persisted-hw-1'),
+    JSON.stringify(beforeOutage).slice(0, 220),
+  );
+  const probeCallsBefore = p3b.host.calls.length;
+  p3b.host.fail = true;
+  const afterOutage = await attempt(p3b, 'subagent_impl', { description: 'enumeration now failing' });
+  check(
+    'P3 随后枚举抛错 → 仍被拒（读不到不等于没有）',
+    afterOutage.ok === false && /stage CREATION limit reached/i.test(afterOutage.message ?? ''),
+    JSON.stringify(afterOutage).slice(0, 240),
+  );
+  check(
+    'P3 拒绝文案用高水位那次观测的清单兜底（列出持久面 id + label）',
+    (afterOutage.message ?? '').includes('persisted-hw-1') && (afterOutage.message ?? '').includes('impl/high-water row'),
+    (afterOutage.message ?? '').slice(0, 240),
+  );
+  check(
+    'P3 高水位让判定在同步阶段就完成（只多一次运行闸门探测，创建闸门不再依赖持久面）',
+    p3b.host.calls.length - probeCallsBefore === 1,
+    'listing calls +' + (p3b.host.calls.length - probeCallsBefore),
+  );
+  check('P3 高水位路径同样没有创建', p3b.calls.start === 0, 'start ' + p3b.calls.start);
+
+  // P3.3b 高水位已知且仍在上限内 → 枚举失败时放行（不因瞬时失败过度拒绝 / 永久卡死）
+  const p3c = await newHarness('parent-p3c', capFor({ impl: 2 }));
+  p3c.host.rows = persistRows([['persisted-hw-2', 'impl/one known child']]);
+  const knownOne = await attempt(p3c, 'subagent_impl', { description: 'records a known count of 1' });
+  check('P3 高水位已知（1）且上限 2：先成功派发一次以记录观测', knownOne.ok === true, JSON.stringify(knownOne).slice(0, 200));
+  p3c.host.fail = true;
+  const duringOutage = await attempt(p3c, 'subagent_impl', { description: 'second while listing fails' });
+  check(
+    'P3 高水位已知且仍在上限内 → 枚举失败时放行（瞬时失败不得变成永久卡死）',
+    duringOutage.ok === true && p3c.calls.start === 2,
+    JSON.stringify(duringOutage).slice(0, 240) + ' start ' + p3c.calls.start,
+  );
+
+  // P3.4 宿主根本没有 listChildren（永久形状差异，非瞬时）→ 不得被「无法核实」卡死
+  const p3d = await newHarness('parent-p3d', capFor({ impl: 1 }));
+  delete p3d.subagents.listChildren;
+  const noListing = await attempt(p3d, 'subagent_impl', { description: 'host has no listing' });
+  check(
+    'P3 宿主没有 listChildren（永久形状差异）→ 按台账判定，不被「无法核实」卡死',
+    noListing.ok === true,
+    JSON.stringify(noListing).slice(0, 240),
+  );
+  const noListingSecond = await attempt(p3d, 'subagent_impl', { description: 'second with no listing' });
+  check(
+    'P3 没有 listChildren 时台账仍是权威：第 2 个被拒（不得因为读不到就放行）',
+    noListingSecond.ok === false && /stage (concurrency|CREATION) limit reached/i.test(noListingSecond.message ?? ''),
+    JSON.stringify(noListingSecond).slice(0, 260),
+  );
+  p3d.emit('subagent/end', { id: noListing.result.subagentId });
+  p3d.children.set(noListing.result.subagentId, { activity: 'idle' });
+  const noListingThird = await attempt(p3d, 'subagent_impl', { description: 'third with no listing' });
+  check(
+    'P3 没有 listChildren 时创建上限也按台账生效（settle、running 归零后仍被拒）',
+    noListingThird.ok === false && /stage CREATION limit reached/i.test(noListingThird.message ?? ''),
+    JSON.stringify(noListingThird).slice(0, 260),
+  );
+  check('P3 没有 listChildren 的两次拒绝都没有发生创建', p3d.calls.start === 1, 'start ' + p3d.calls.start);
+}
+
+// ── P4. status 不再对全部 root 做 N+1：只扫组合了本预设的 root ──────────────────
+{
+  const p4 = await newHarness('parent-p4', capFor({}));
+  const foreign = p4.addForeignRoot('foreign-root-p4');
+  const rowsByParent = {
+    'parent-p4': persistRows([['p4-impl-1', 'impl/in-preset row']]),
+    'foreign-root-p4': persistRows([['p4-foreign-impl-1', 'impl/foreign row']]),
+  };
+  p4.host.rowsFor = (id) => rowsByParent[id] ?? [];
+  check(
+    'P4 前置：非本预设的 root 确实在 roots() 里，且 composedPreset 与它不同',
+    p4.agentsService.roots().length === 2
+      && p4.presets.composedPreset(foreign.ctx) === 'standard'
+      && p4.presets.composedPreset(p4.parent.ctx) === 'code-pipeline',
+  );
+  const stages = await statusOfHarness(p4);
+  const scanned = [...new Set(p4.host.calls)];
+  check('P4 status 仍会扫本预设 root 的持久面（持久面不漏）', p4.host.calls.includes('parent-p4'), JSON.stringify(scanned));
+  check(
+    'P4 status 不对非本预设的 root 调 listChildren（消除 N+1 的持久 Session-store 读）',
+    !p4.host.calls.includes('foreign-root-p4'),
+    JSON.stringify(scanned),
+  );
+  check(
+    'P4 本预设 root 的持久行出现在 available 里',
+    (stages.impl?.available ?? []).some((row) => row.id === 'p4-impl-1'),
+    JSON.stringify(stages.impl?.available),
+  );
+  check(
+    'P4 非本预设 root 的行没有混进 available',
+    !(stages.impl?.available ?? []).some((row) => row.id === 'p4-foreign-impl-1'),
+    JSON.stringify(stages.impl?.available),
+  );
+}
+
+// ── P5. 运行上限文案不再说谎：running 与 starting 分开报 ────────────────────────
+{
+  // P5.1 正常并发拒绝（确有 1 个在跑）
+  const p5 = await newHarness('parent-p5', capFor({ impl: 1 }));
+  const holder = await attempt(p5, 'subagent_impl', { description: 'occupies the slot' });
+  const busy = await attempt(p5, 'subagent_impl', { description: 'second while running' });
+  check(
+    'P5 正常并发拒绝：前置成立（第 1 个在跑）且第 2 个被拒',
+    holder.ok === true && busy.ok === false,
+    JSON.stringify([holder.ok, busy.ok]),
+  );
+  check('P5 正常并发拒绝：文案报出 running 数（N running）', /\b1 running\b/.test(busy.message ?? ''), (busy.message ?? '').slice(0, 200));
+  check(
+    'P5 正常并发拒绝：仍声明「不是阶段失败」并给复用出路',
+    (busy.message ?? '').includes('NOT a stage failure') && (busy.message ?? '').includes('pipeline_followup'),
+    (busy.message ?? '').slice(0, 200),
+  );
+  check(
+    'P5 确有在跑时仍引导等 settled notice（在跑的子代理会真的 settle）',
+    (busy.message ?? '').includes('Wait for a settled notice'),
+    (busy.message ?? '').slice(0, 240),
+  );
+  check('P5 旧措辞 "are already running" 在并发拒绝文案里不再出现', !(busy.message ?? '').includes('are already running'));
+
+  // P5.2 「0 在跑、1 个创建在途」：用挂起的 listChildren 把第 1 个调用卡在预留窗口
+  const p5b = await newHarness('parent-p5b', capFor({ impl: 1 }));
+  let releaseHold;
+  p5b.host.hold = new Promise((resolve) => { releaseHold = resolve; });
+  const parked = runStage(p5b, 'subagent_impl', { description: 'parked in flight' }).then(
+    (value) => ({ ok: true, result: value }),
+    (error) => ({ ok: false, message: String(error?.message ?? error) }),
+  );
+  // 等到第 1 个调用**真的**进入预约后的 listChildren 探测（假宿主在 await hold 之前记账）：
+  // 固定 sleep 在负载高的机器上可能抢跑，这里轮询到确定性的窗口再发第 2 个。
+  for (let waited = 0; waited < 200 && p5b.host.calls.length === 0; waited += 1) await tick(5);
+  const starting = await attempt(p5b, 'subagent_impl', { description: 'second while starting' });
+  releaseHold();
+  p5b.host.hold = null;
+  const parkedResult = await parked;
+  check(
+    'P5 前置：第 1 个调用确实卡在「已预留、尚未创建」窗口（它最终成功）',
+    parkedResult.ok === true && p5b.calls.start === 1,
+    JSON.stringify(parkedResult).slice(0, 220) + ' start ' + p5b.calls.start,
+  );
+  check(
+    'P5 「0 在跑、1 个创建在途」：文案报 starting（dispatch in flight）而不是谎报 running',
+    starting.ok === false && /1 starting \(dispatch in flight\)/.test(starting.message ?? '')
+      && !/\d+ running\b/.test(starting.message ?? ''),
+    (starting.message ?? '').slice(0, 260),
+  );
+  check(
+    'P5 该文案不再教模型「等 settle 通知」（settle 不会腾出这种名额）',
+    !(starting.message ?? '').includes('Wait for a settled notice')
+      && (starting.message ?? '').includes('will NOT free one')
+      && (starting.message ?? '').includes('LATER step'),
+    (starting.message ?? '').slice(0, 340),
+  );
+  check(
+    'P5 该文案仍是策略拒绝：不是阶段失败、带复用出路',
+    (starting.message ?? '').includes('NOT a stage failure') && (starting.message ?? '').includes('pipeline_followup'),
+    (starting.message ?? '').slice(0, 240),
+  );
+}
+
+// ── P6. 顺手项：跨父会话精确 id 不得命中；description 参数说明 ──────────────────
+{
+  const owner = await newHarness('parent-p6-owner', capStages(0));
+  const foreignChild = await runStage(owner, 'subagent_impl', { description: 'owned by another session' });
+  const other = await newHarness('parent-p6-other', capStages(0));
+  const beforeSend = other.calls.sendMessageOptions.length;
+  const cross = await attemptFollowup(other, foreignChild.subagentId, 'steal this child');
+  check(
+    'P6 跨父会话精确 id 被拒（不得把消息投给别的会话的子代理）',
+    cross.ok === false && /no stage subagent matches/.test(cross.message ?? ''),
+    JSON.stringify(cross).slice(0, 240),
+  );
+  check(
+    'P6 跨父会话精确 id：一次都没有投递',
+    other.steers.length === 0 && other.calls.sendMessageOptions.length === beforeSend,
+    'steers ' + other.steers.length + ' / sendMessage ' + (other.calls.sendMessageOptions.length - beforeSend),
+  );
+  check(
+    'P6 前置：那个 id 确实属于另一个父会话（本会话的台账与持久面都为空）',
+    owner.children.has(foreignChild.subagentId) && other.children.size === 0,
+  );
+  check(
+    'P6 description 参数说明仍在（子代理显示名，非对话内容）',
+    String(h.tools.get('subagent_impl')?.parameters?.properties?.description?.description ?? '')
+      .includes("label shown as this subagent's name"),
+    String(h.tools.get('subagent_impl')?.parameters?.properties?.description?.description ?? '').slice(0, 80),
+  );
 }
 
 check(

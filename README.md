@@ -19,7 +19,7 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 - **设置页（浏览器）**：Settings → 代码流水线，每阶段配置 `enabled` /
   `provider` / `model` / `reasoningEffort` / `maxConcurrency`，provider/模型列表来自
   `GET /dsh-code-pipeline/options`（不可用时相应字段禁用并提示，不允许手输）；
-  每阶段卡片还显示「当前运行 N / 上限 M」，数据来自
+  每阶段卡片还显示「当前运行 N / 上限 M / 已创建 K」与可复用子代理清单，数据来自
   `GET /dsh-code-pipeline/status`（每 5 秒轮询）。
 
 ## 角色边界（硬约束）
@@ -44,6 +44,13 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   `plan` / `impl` / `review`（含中文别名 规划/计划/实现/评审/审查）| 完整
   `subagentId`（`session-...`，也支持唯一前缀）；
 - 参数 `message`：要插入的需求变更文本（完整、自包含——子代理没有本对话上下文）；
+- 参数 `compact`（可选，默认 `false`）：**在投递之前**压缩**该子代理自己**的历史
+  （走该预设 realm 私有的 `compaction` 服务——`agentPresets.serviceFor(agent, "compaction")`，
+  超时 10 分钟）。只应在「复用会把干扰带进来」时用（四条可判定判据见预设的
+  「Reuse the stage subagents you already have」小节）；代价是抹掉它超出摘要的历史记忆并
+  放弃前缀缓存。**压缩失败 ⇒ 什么都不投递**（错误文案明说 inbox 未变，可用 `compact: false`
+  重试）；`compactNow` 返回「没有可压区间」不算失败，投递照常。冷子代理（重启后本进程未唤醒）
+  无法压缩——先做一次 `compact: false` 的普通复用唤醒它；
 - 行为：调用宿主原生 `subagents.sendMessage`（alpha.4 语义 = **steer/插入**）——
   运行中的子代理在**下一个模型步骤**就看到该消息（不排进队列等当前回合结束）；
   子代理已空闲/已结束时会唤醒开新回合处理；
@@ -55,12 +62,18 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 - **它同时是多轮评审复用的通道**：评审第 2 轮起用 `pipeline_followup` 续用同一个评审
   子代理（见下节「多轮评审复用」）——同一个投递通道，`child` 传该评审子代理的 `subagentId`。
 
-## 多轮评审复用（prompt 协议：续用同一个评审子代理）
+## 多轮评审复用（续用同一个评审子代理）
 
 多轮评审（plan → impl ↔ review 里的 review 轮次）不再每轮新开一个评审子代理：**第一轮
-之后的所有轮次通过已有的 `pipeline_followup` 续用第一轮那个评审子代理**。这是**纯 prompt
-约定**（写在 `preset/code-pipeline/agent.cordis.yml` 的 persona 里），不改插件、不加工具
-参数、不加设置项。
+之后的所有轮次通过已有的 `pipeline_followup` 续用第一轮那个评审子代理**。
+
+这是「**同一任务只创建一次**」这条统一协议在评审阶段的具体形态：0.2.0 起预设新增了同级小节
+「Reuse the stage subagents you already have (SAME child, later rounds)」，把
+**plan / impl / review 三阶段**都写进同一条协议（第一次用阶段工具派发，之后每一轮都用
+`pipeline_followup` 发给已有的那个子代理；只有出现干扰时才 `compact: true` 先压缩再投递），
+插件层再用「每 (父会话 × 阶段) 已创建数硬上限」把它变成机制（见
+「每阶段并发上限与并行派发」），并给 `pipeline_followup` 加了 `compact` 参数——
+**没有新增任何设置项**（复用既有 `maxConcurrency`）。
 
 - **为什么**：子代理从空会话起步——每轮新开 `subagent_review` 都要重新吃一遍「计划 +
   完整 diff + 历史结论」，而且新会话没有前缀缓存可命中；续用同一个子代理时，这些都在它的
@@ -80,7 +93,8 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   - 多个独立目标并行评审时，每个目标一个评审子代理，按各自的 `subagentId` 续用；
   - `pipeline_followup` 报「没有匹配的阶段子代理」时（例如 dsh 重启后插件进程内的派发台账
     被清空），退回一次带完整物料（含计划）的 `subagent_review` 即可——这是**回退**，不是
-    「阶段不可用」，不要因此终止任务；
+    「阶段不可用」，不要因此终止任务；但若该阶段**已达创建上限**（见下节），这次回退同样会被
+    拒绝——此时按超限文案给出的清单复用，或把上限与清单报告给用户；
   - 宿主侧依据：`pipeline_followup` 走 `subagents.sendMessage`，空闲/已 settle 的子代理会被
     唤醒成新一轮（宿主 `steer` 语义：idle driver starts a turn；`queue` 模式同理排一个新回合），
     且再次 settle 时父会话照常收到完成通知。
@@ -239,6 +253,10 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
 > 已保存过阶段配置的会话不受影响：`settings.yaml` 的 `code-pipeline.stages` 里显式
 > 写下的 provider/model 始终优先于这里的默认值。
 
+> **并发上限默认 `0` 的语义在 0.2.0 保持不变**（= 不限制，零回归）。要**强制复用**、让同一
+> (父会话 × 阶段) 到点后只能续用已有子代理，请把该阶段的「最大并发子代理数（含已创建）」
+> 设为 `≥ 1`；该数值同时管两件事：同时运行数 + 已创建（含已结束）总量。
+
 > 无 fallback 孪生工具:阶段 provider/凭据/启动失败时直接报错并报告,不自动换路由。
 
 ## 思考等级(reasoningEffort)
@@ -256,9 +274,31 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
 
 ## 每阶段并发上限与并行派发
 
-- **设置项**：Settings → 代码流水线 → 每个阶段卡片的「最大并发子代理数」。口径是
-  **同一父会话内该阶段同时运行（宿主 `activity = running`）的子代理数**；`0` = 不限制（默认）。
-- **准入判定（两步）**：
+- **设置项**：Settings → 代码流水线 → 每个阶段卡片的「最大并发子代理数（含已创建）」。
+  同一个数值是**双层上限**，两道闸门都按 `(父会话 × 阶段)` 计数：
+  1. **运行上限**：同一父会话内该阶段**同时运行**（宿主 `activity = running`）的子代理数；
+  2. **创建上限**：该阶段**已经创建过**的子代理总数——含已结束（settle / 被墙钟硬停 /
+     `lost`）的；同一 workstream 的多轮复用**不**占新名额（复用不创建）。
+  `0` = 不限制（默认，零回归）。
+- **两道闸门共用一个值，且运行闸门先判**：一次派发先过运行闸门、再过创建闸门。所以上限
+  较小时，**第 1 个子代理还在跑**时紧跟着的第 2 次派发会先撞**运行上限**（这条错误文案只带
+  一句「复用永远可用」的提醒，不带清单）；等它**结束之后**再派才撞**创建上限**（这条文案才
+  带可复用子代理清单与 `compact` 指引）。撞哪一道都**不是**阶段不可用。
+- **创建上限"只增不减"**：等一个子代理 settle **不会**腾出创建名额（上限数的是「创建」，
+  不是「在跑」）；本会话内到顶后，除**复用**（`pipeline_followup`，必要时先
+  `compact: true` 压缩再投递）外不再放行新的派发。这是刻意的选择——否则「创建了但宿主
+  暂时枚举不到」就成了穿透窗口，上限形同虚设。
+- **创建数的真值** = 本进程台账（已创建过的，永不移除）∪ 宿主
+  `subagents.listChildren(parent.id)` 的当前可见行；阶段归属按优先级判定：台账记录 →
+  活子代理的 `options.stageKey` → label 的 `<stage>/` 前缀（0.2.0 起阶段工具自动给
+  `description` 加该前缀，所以宿主持久面上的 label 也是阶段标记）。创建闸门同样先做**同步
+  预判**（台账 + 正在创建中的预留），`await listChildren` 之后再用**重算后的并集计数**复检，
+  抛错时归还预留——并发派发时不会互相算漏。
+- **超限拒绝自带出路**：错误里列出该阶段**可复用子代理**（`id` + label + 活跃状态），并给
+  三条出路：① `pipeline_followup` 复用其中一个；② 有干扰时 `compact: true` 先压缩再复用；
+  ③ 全都在跑时等它的完成通知后再复用。文案明确写着「这是对**创建**的策略上限，不是阶段
+  不可用」——主代理**不得**按 UNAVAILABLE 规则终止任务。
+- **运行闸门的准入判定（两步）**：
   1. **同步先到先得**：用插件账本（运行中 + 本次启动预留）判定，超限立即拒绝；
      通过则同步占位。判定必须完全同步——PTC 的 `Promise.all` 会让同一阶段的多个
      调用同时进入 `execute`，若等 `await` 之后再判定，两个并发调用会互相把对方
@@ -269,19 +309,25 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
      用结果修剪账本里已 settle 的条目（自愈）。宿主没有 `listChildren` 或查询失败
      时退回账本，并用 live Agent 的 `status === "idle"` 修剪。
   超限时工具**拒绝**本次派发，错误信息明确标注「这是瞬时策略拒绝，不是阶段不可用」——
-  主代理应等完成通知后派发剩余目标，或改用 `pipeline_followup` 给运行中的子代理
-  插话，**不得**按 UNAVAILABLE 规则终止任务。
+  主代理应**先复用**已有子代理（`pipeline_followup`；撞创建上限那条错误还会直接给出可复用
+  清单），或给运行中的子代理插话，**不得**按 UNAVAILABLE 规则终止任务，也不要把「再派一个
+  新的子代理」当成唯一出路。
 - **动态修改**：工具每次调用都读设置，所以保存后**下一次派发**立即生效，无需重启。
   调高立即放开；**调低不会中断正在运行的子代理**，只是在新派发时按新值拦截，直到
   运行数降到新值以下。设置页每 5 秒轮询 `/dsh-code-pipeline/status` 显示
-  「当前运行 N / 上限 M」。
+  「当前运行 N / 上限 M / 已创建 K」与可复用子代理清单（端点缺 `created` / `available`
+  字段时优雅降级，只显示旧半句）。
 - **边界**：宿主每个 `run_code` 程序仍有 `maxParallelSubCalls`（默认 10）的并行
   子调用上限，所以设 20 也不会在一个程序里真正并行超过 10 个；`ralph` 派发的子
-  代理不经过阶段工具，不受此限；账本是进程内的，dsh 重启后无法从宿主数据恢复旧
-  子代理的阶段身份（它们不再计入）。
-- **预设侧的并行偏好**：`code-pipeline` 预设的 pipeline protocol 要求
-  「独立目标优先在一个程序里并行派发多个阶段子代理以加快进度」，并说明超限拒绝
-  是瞬时的、不是阶段失败。
+  代理不经过阶段工具，不受此限；创建数的计数是「本进程台账 ∪ 宿主当前可见行」，dsh 重启后
+  由宿主接手——但**本轮之前**创建、既没有 `<stage>/` label 前缀也没有 `stageKey` 的旧
+  子代理无法回溯归属：它们既不计入创建数、也不进复用清单。
+- **预设侧的并行偏好 + 「每个独立工作流至多创建一次」**：`code-pipeline` 预设的
+  pipeline protocol 要求「独立目标优先在一个程序里并行派发多个阶段子代理以加快进度」，
+  并说明超限拒绝是瞬时的、不是阶段失败；（0.2.0 起）**每个独立 workstream 至多创建一次**：
+  第一轮用 `subagent_impl`，之后（评审问题、改需求、墙钟续跑）一律用 `pipeline_followup`
+  回到那个子代理；并行的创建数受该阶段**创建上限**约束，超出上限时改为复用（必要时先
+  `compact: true` 压缩），而不是继续创建。
 
 ## 每阶段墙钟预算（超时自动中断 + 收尾报告）
 
@@ -314,6 +360,7 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   - 收尾回合会重新计入该阶段并发数（宿主 `activity = running`），并受 3 分钟宽限约束。
   - `GET /dsh-code-pipeline/status` 每阶段新增 `budgetMinutes` / `timedOut` /
     `longestRunningMs`；设置卡片显示「墙钟预算 N 分钟；最早已运行 M 分钟；K 个已超时（中断 / 收尾中）」。
+    （0.2.0 起同一端点还返回 `created` / `available`，见「每阶段并发上限与并行派发」。）
 
 ## 重要实现事实（与官方 dsh 源码核对）
 
@@ -370,7 +417,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 36 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 90 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -395,6 +442,23 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 **宿主改写文案时仍能回退**（`message` 不再以 `invalid payload for subagent.prompt` 开头、
 但 `details.issues` 仍在 → OR 兜底照常继续探测并成功投递）。
 
+0.2.0 起断言数 36 → **90**（新增 54 项），分四类：
+**A. 创建数量硬闸门**——`cap=1` 时第 1 个派发成功、第 2 个（第 1 个仍在跑）被**运行上限**拦下、
+子代理结束、running 归零后第 3 个仍被**创建上限**拦下（数的是「已创建」而不是「在跑」）、
+三种被拒路径下宿主创建入口 `startContinuable` 始终只被调用 1 次（证明是代码拦下的）、
+创建上限文案带可复用清单（id + label + 活动状态）与 `pipeline_followup` / `compact: true` 出路、
+`cap=0` 连派 3 个全部成功（零回归）、`Promise.all` 并发 3 个只放行 1 个（同步预留生效）、
+只靠宿主 `listChildren` 里带 `<stage>/` 前缀的持久行也能判定已达上限；
+**B. 压缩顺序与失败路径**——`compact: true` 时 `compactNow` 一定早于投递、恰好一次压缩 + 恰好一次投递、
+压缩服务走 `agentPresets.serviceFor(child, "compaction")` 且首参是目标子代理、返回「无可压区间」
+不算失败（`compacted` 不置 true、投递照常）、`busy` / `summary` 失败码一律抛错且两条投递通道
+都没动、`serviceFor` 返回 `undefined` 或没有 `compactNow` 的对象同样拒绝且未投递、
+冷子代理报错并提示先用 `compact: false` 唤醒（且根本没调用 `compactNow`）；
+**C. 别名按 `seq` 稳定**——`rearmStageBudget` 改写 `entry.at` 之后 `latest` / 阶段别名仍指向
+最后派发的那个；
+**D. status 新字段与阶段描述**——`created` / `available` 的形状与内容、三条阶段 description 里的
+创建上限与 `compact` 指引。
+
 ## 计划的工作流切分（Workstreams）与并行 impl
 
 并行 impl 的前提是**互不重叠的文件所有权**——同一份文件被两个实现者同时改会互相覆盖。这条契约落在两处：
@@ -405,7 +469,9 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
   workstream（依赖其余）；一个 workstream 必须值得独占一个子代理（大致 >1 个文件或 >15 分钟），不要把一件
   连贯的改动静默拆成无法各自验证的碎片；每个 workstream 自带验收检查。
 - **主代理（预设 persona）**：当计划声明 ≥2 个「文件不相交且无依赖」的 workstream 时，**在一个程序里并行派发**
-  每个独立 workstream 一个 `subagent_impl`（`Promise.all`）；有依赖或共享文件的顺序执行，`integration` 最后跑。
+  每个独立 workstream **至多一个** `subagent_impl`（`Promise.all`，并行度受该阶段**创建上限**约束：
+  超出上限时改为用 `pipeline_followup` 复用已有子代理、必要时先 `compact: true` 压缩，而不是继续创建）；
+  有依赖或共享文件的顺序执行，`integration` 最后跑。
   评审阶段按 workstream 各自捕获**路径受限 diff**（`git diff HEAD -- <该 workstream 的 owned paths>`）交给各自的
   `subagent_review`——并行期间同一工作区的 `git diff HEAD` 会混入别人的改动。切分不清楚或看起来不对时，
   **让 plan 阶段改计划**，不要自己发明切分。
@@ -413,6 +479,51 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
   （代价是每个子代理各付一次 system/persona/派发消息，所以小任务不切）。
 
 ## 变更记录
+
+- **0.2.0（复用优先从"劝说"升级为硬机制：创建数量上限 + 压缩后复用）**：
+  - **问题**：阶段子代理都从空会话起步，同一任务的多轮（改需求、多轮评审、墙钟续跑）每轮新开
+    一个子代理 ⇒ 会话数暴涨、每轮重复付 system/persona/派发消息的钱，而且新会话**没有前缀
+    缓存可命中**。此前只靠 persona 劝说「复用已有的子代理」并不可靠（实测里调度方在专门修这个
+    浪费时又犯了一遍），所以这一轮把机制落到代码路径里。
+  - **做法**：
+    1. **创建数量硬上限**：每 `(父会话 × 阶段)` 统计**已创建**（含已结束）的子代理总数，
+       超限派发**在代码路径里被拒绝**（不是劝说）；错误文案自带**可复用清单**（`id` + label +
+       活跃状态）与三条出路（复用 / 有干扰时先 `compact: true` 压缩再复用 / 等 settled 后复用），
+       并明确「这是对**创建**的策略上限，不是阶段不可用」。**复用既有设置项**
+       `stages.<stage>.maxConcurrency`（`0 = 不限制` 原样保留，零回归），**没有新增任何设置项**。
+       计数真值 = 进程内台账 ∪ 宿主 `subagents.listChildren`，**只增不减**（等 settle 不腾名额）；
+       同步预留 + `await listChildren` 后复检，防 PTC `Promise.all` 竞态。
+    2. **`pipeline_followup` 新增 `compact: true`**：在**投递之前**压缩**目标子代理自己**的
+       历史（顺序是宿主要求：`compactNow` 在 inbox 非空时抛 `busy`）。服务寻址走该预设
+       realm 私有的 `compaction`（`agentPresets.serviceFor(agent, "compaction")`，**不能**用
+       `ctx.get("compaction")`——宿主 root realm 里另有一个实例，用它压缩会打错 session 的账
+       且不报错）；超时 10 分钟，与调用方 signal 用 `AbortSignal.any` 合并。**任何压缩失败都
+       保证未投递**（冷子代理 / 服务不可达 / 各失败码各有对应文案）。
+    3. **三阶段统一复用协议**：预设新增同级小节「Reuse the stage subagents you already have
+       (SAME child, later rounds)」，把 **plan / impl / review** 都纳入「第一次派发、之后每轮
+       复用同一个子代理」，并给出**压缩的四条可判定判据**；同时修掉六处反向 / 过期措辞
+       （含删掉「review 返回 CHANGES REQUIRED 就重新派发 `subagent_impl`」这条会把浪费重新
+       引入的旧指令）。
+    4. **label 阶段前缀 + 别名稳定**：阶段子代理的显示名统一为 `<stage>/<description>`，让宿主
+       持久面（`listChildren.label`）也能归属阶段；别名解析改用单调递增的 `seq`（原先用会被
+       续跑改写的 `entry.at`，「最近派发」在续跑后会漂移）。
+    5. **status 端点新增** `created`（已创建数）与 `available`（可复用子代理数组
+       `{ id, label, activity }`）；设置卡片显示「当前运行 N / 上限 M / 已创建 K」+ 可复用清单。
+  - **测试**：`test/watchdog.smoke.mjs` 从 36 项扩到 **90 项断言，0 failure(s)**（新增 54 项：
+    创建闸门机制 / 压缩顺序与失败路径 / 别名稳定 / status 字段）。
+  - **已知边界（如实记录）**：
+    - **旧子代理无法回溯**：本轮之前创建的子代理重启后既没有 `<stage>/` label 前缀、也没有
+      `stageKey`，既不计入创建数、也不进复用清单；
+    - **冷子代理无法压缩**：重启后本进程未唤醒的子代理，`compact: true` 会报错并指引先用
+      `compact: false` 复用一次唤醒它；
+    - **压缩有代价**：会抹掉该子代理超出摘要的历史记忆并放弃前缀缓存，所以只应在「复用会把
+      干扰带进来」时使用（四条判据写在预设的新小节里）；
+    - **压缩需要目标 idle**：先压缩后投递是宿主要求的顺序；
+    - **两道闸门共用同一个 `maxConcurrency`，运行闸门先判**：上限很小时，第 1 个子代理仍在跑时
+      的第 2 次派发通常先撞运行上限（文案只有复用提醒），等它结束后才撞创建上限（文案带清单与
+      `compact` 指引）；
+    - **创建数只增不减**：等一个子代理 settle 不腾出创建名额，本会话到顶后除复用外不再放行；
+    - **`engines` 不变**（本轮不涉及宿主契约）。
 
 - **0.1.19（宿主事实核对：文案口径修正 + 探测表清理 + 测试加固）**：
   - **`run_code` 墙钟口径改正**：库内注释、`run_in_background: false` 的拒绝错误串、预设 persona
@@ -572,7 +683,8 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
     （子代理自行声明只会登记到子代理会话，主会话看不到）。
 - **0.1.11（每阶段并发上限 + 预设并行派发偏好）**：
   - 新增设置项 `stages.<stage>.maxConcurrency`（默认 0 = 不限制）：同一父会话内该
-    阶段同时运行的子代理上限。准入两步：**同步先到先得**（账本 + 预留，避免并发
+    阶段同时运行的子代理上限（**0.2.0 起同一数值扩展为双层上限**——同时运行 + 已创建总量，
+    见「每阶段并发上限与并行派发」）。准入两步：**同步先到先得**（账本 + 预留，避免并发
     调用互相算名额而双双被拒）→ **异步核对**宿主 `subagents.listChildren` 的
     `activity === "running"` 并修剪账本（覆盖 PTC `Promise.all` 竞态、重启后或
     被 followup 唤醒的子代理）。超限拒绝并明确标注为瞬时策略拒绝（**不是**阶段
