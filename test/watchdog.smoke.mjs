@@ -7,10 +7,11 @@
 // 运行：node test/watchdog.smoke.mjs（或 npm test）
 // 依赖：@deepseek-ai/schemastery 必须可解析（pnpm install，或本地开发时链接宿主副本）。
 
-import { cpSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parse } from 'yaml';
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -615,11 +616,17 @@ const attemptFollowup = async (harness, child, message, compact) => {
   check('A3 创建上限文案说明「等 settle 不腾名额、只有复用才行」', creationMessage.includes('does NOT free a slot'), creationMessage.slice(0, 300));
   check('A3 宿主的创建入口依旧只被调用 1 次（第 3 次没有真的创建）', cap.calls.start === 1, 'start ' + cap.calls.start);
 
-  // A2 文案契约：作用在「创建上限」那条错误上 —— 只有它携带可复用清单与 compact 出路。
+  // A2 文案契约：作用在「创建上限」那条错误上 —— 只有它携带可复用清单与复用出路。
   check('A2 创建上限文案带第 1 个子代理的 id', creationMessage.includes(firstId), firstId);
   check('A2 创建上限文案带它的 label（含阶段前缀）', creationMessage.includes(firstLabel), firstLabel);
   check('A2 创建上限文案给出 pipeline_followup 复用出路', creationMessage.includes('pipeline_followup'));
-  check('A2 创建上限文案给出「有干扰时 compact: true」出路', creationMessage.includes('compact: true'));
+  check(
+    'A2 创建上限文案不再把 compact: true 当出路，而是「压缩不掉 → 接受干扰 / 有名额才新派」',
+    creationMessage.includes('you cannot compact it away')
+      && creationMessage.includes('only while this session still has a creation slot')
+      && !creationMessage.includes('compact: true'),
+    creationMessage.slice(0, 320),
+  );
   check(
     'A2 创建上限文案列出的可复用清单带 id + label + 活动状态',
     creationMessage.includes(firstId + '  "' + firstLabel + '"') && (creationMessage.includes('[running]') || creationMessage.includes('[inactive]')),
@@ -817,7 +824,7 @@ const attemptFollowup = async (harness, child, message, compact) => {
       && cp.calls.sendMessageOptions.length === beforeCold,
     JSON.stringify(coldResult).slice(0, 260),
   );
-  check('B11 冷子代理的错误提示先做一次 compact:false 的普通复用唤醒', (coldResult.message ?? '').includes('compact: false'));
+  check('B11 冷子代理的错误提示：改走不带 compact 的投递、不承诺重试', (coldResult.message ?? '').includes('compact: false'));
   check('B11 冷子代理路径根本没有调用 compactNow', !cp.calls.order.includes('compactNow'), JSON.stringify(cp.calls.order));
 }
 
@@ -886,10 +893,10 @@ const attemptFollowup = async (harness, child, message, compact) => {
     JSON.stringify(stageKeys.map((key) => (stages[key]?.available ?? []).map((row) => row.label).slice(0, 3))),
   );
   check(
-    'D15 三条阶段描述都写明创建上限 + compact 复用指引 + pipeline_followup',
+    'D15 三条阶段描述都写明创建上限 + compact 对已 settle 子代理不可用 + pipeline_followup',
     stageKeys.every((key) => {
       const text = String(h.tools.get('subagent_' + key)?.description ?? '');
-      return text.includes('CREATION CAP') && text.includes('compact: true') && text.includes('pipeline_followup');
+      return text.includes('CREATION CAP') && text.includes('compact: true cannot be applied to a settled (cold) child') && text.includes('pipeline_followup');
     }),
     JSON.stringify(stageKeys.map((key) => String(h.tools.get('subagent_' + key)?.description ?? '').includes('CREATION CAP'))),
   );
@@ -897,6 +904,333 @@ const attemptFollowup = async (harness, child, message, compact) => {
     'D15 三条阶段描述都说明「settle 不腾创建名额」',
     stageKeys.every((key) => String(h.tools.get('subagent_' + key)?.description ?? '').includes('does NOT free a creation slot')),
   );
+}
+
+// ── E. 预设内容契约（0.2.2）：压缩出厂默认 + 扇出分级 + 冷子代理边界 + 评审增量轮 ──
+// 预设既是「策略文本」又是设置页的写入目标，所以它的回归只能落在内容契约上：解析真实
+// YAML、钉住压缩行的**出厂默认值**与宿主加载期不变式，并确认四处策略锚点仍在 persona 里。
+{
+  const presetPath = join(root, 'preset', 'code-pipeline', 'agent.cordis.yml');
+  const presetText = readFileSync(presetPath, 'utf8');
+  let preset;
+  let parseError;
+  try {
+    preset = parse(presetText);
+  } catch (error) {
+    parseError = String(error?.message ?? error);
+  }
+  check('E1 预设文件可被 yaml 解析（E2–E8 依赖解析结果）', parseError === undefined, parseError);
+  const rows = Array.isArray(preset) ? preset : [];
+  const groupRows = rows.find((row) => row?.id === 'compaction')?.config;
+  const basic = (Array.isArray(groupRows) ? groupRows : []).find((row) => row?.id === 'compaction-basic')?.config ?? {};
+  check(
+    'E2 compaction-basic 的出厂默认 = thresholdRatio 0.5 / retainRatio 0.1（设置页「压缩触发比例」可覆盖）',
+    basic.thresholdRatio === 0.5 && basic.retainRatio === 0.1,
+    JSON.stringify(basic),
+  );
+  check(
+    'E3 宿主加载期不变式：retainRatio < thresholdRatio（0.1 < 0.5）',
+    typeof basic.retainRatio === 'number' && typeof basic.thresholdRatio === 'number'
+      && basic.retainRatio < basic.thresholdRatio,
+    JSON.stringify(basic),
+  );
+  check(
+    'E8 预设只写比例、绝不写 retainTokens（宿主拒绝两种保留形式并存）',
+    !presetText.includes('retainTokens'),
+  );
+  const persona = String(rows.find((row) => row?.id === 'persona')?.config?.prefix ?? '');
+  check('E4 扇出分级锚点在 persona 里（Right-size the pipeline）', persona.includes('Right-size the pipeline'));
+  check('E5 文档型工作流锚点在 persona 里（never one reviewer per workstream）', persona.includes('never one reviewer per workstream'));
+  check('E6 冷子代理锚点在 persona 里（A cold child cannot be compacted）', persona.includes('A cold child cannot be compacted'));
+  check(
+    'E7 评审第 2 轮只送增量：新锚点在、旧的 FULL NEW diff 措辞已消失',
+    persona.includes("only the hunks that changed since that reviewer's last verdict")
+      && !persona.includes('**the FULL NEW diff** captured at this moment'),
+  );
+  check(
+    'E9 冷子代理边界改后的第 3 条锚点在 persona 里（唤醒也救不了）',
+    persona.includes('there is no way to compact a settled child, and waking it does not help'),
+  );
+}
+
+// ── F. 压缩触发比例对账器（reconcileCompactionRow，纯函数，可离线单测）──────────
+// 设置页的值要写进**已安装**的预设组合，全靠这个函数：它必须只改 compaction-basic
+// 那一行、覆盖三种用户安装态、幂等，且行外一个字节都不动（行尾符、注释、persona 块标量）。
+{
+  const { reconcileCompactionRow, compactionRatios } = plugin;
+  const linesOf = (text) => text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+  const bodies = (text) => linesOf(text).map((line) => line.replace(/\r?\n$|\r$/, ''));
+  // fixture：CRLF + 注释 + persona 块标量 + 前后各一行，一起验证「行外原样」。
+  const fixture = (rowLines) => [
+    '# top comment (must survive byte-for-byte)',
+    '- id: persona',
+    "  name: '@deepseek-ai/dsh-persona'",
+    '  config:',
+    '    prefix: |',
+    '      multi-line persona text',
+    '      stays byte-identical',
+    '- id: compaction',
+    '  name: cordis:group',
+    '  config:',
+    ...rowLines,
+    '    - id: command-compact',
+    "      name: '@deepseek-ai/dsh-command-compact'",
+    '- id: present',
+    "  name: '@deepseek-ai/dsh-tool-present'",
+    '',
+  ].join('\r\n');
+
+  // F1 Case A：行内没有 config:（用户当前的安装态）→ 紧跟 name: 插入 config: 块。
+  const caseA = fixture([
+    '    - id: compaction-basic',
+    "      name: '@deepseek-ai/dsh-compaction-basic'",
+  ]);
+  const a = reconcileCompactionRow(caseA, compactionRatios(0.5));
+  const aLines = bodies(a.text);
+  const aName = aLines.indexOf("      name: '@deepseek-ai/dsh-compaction-basic'");
+  check(
+    'F1 对账器 Case A：没有 config: 的行在 name: 之后补出 config: 块（thresholdRatio / retainRatio）',
+    a.found === true && a.changed === true && aName !== -1
+      && aLines[aName + 1] === '      config:'
+      && aLines[aName + 2] === '        thresholdRatio: 0.5'
+      && aLines[aName + 3] === '        retainRatio: 0.1'
+      && aLines[aName + 4] === '    - id: command-compact',
+    JSON.stringify(aLines.slice(aName, aName + 5)),
+  );
+
+  // F2 Case B：已有阈值 / 保留比例 → 就地替换数值，结构不变。
+  const caseB = fixture([
+    '    - id: compaction-basic',
+    "      name: '@deepseek-ai/dsh-compaction-basic'",
+    '      config:',
+    '        thresholdRatio: 0.8',
+    '        retainRatio: 0.16',
+  ]);
+  const b = reconcileCompactionRow(caseB, compactionRatios(0.5));
+  const bLines = bodies(b.text);
+  check(
+    'F2 对账器 Case B：已有的 thresholdRatio / retainRatio 就地改成 0.5 / 0.1（不增行）',
+    b.changed === true
+      && bLines.includes('        thresholdRatio: 0.5')
+      && bLines.includes('        retainRatio: 0.1')
+      && !bLines.includes('        thresholdRatio: 0.8')
+      && bLines.length === bodies(caseB).length,
+    JSON.stringify(bLines.filter((line) => line.includes('Ratio'))),
+  );
+
+  // F3 Case C：老副本里的 retainTokens: 40000 → retainRatio，两种保留形式绝不同时出现。
+  const caseC = fixture([
+    '    - id: compaction-basic',
+    "      name: '@deepseek-ai/dsh-compaction-basic'",
+    '      config:',
+    '        thresholdRatio: 0.2',
+    '        retainTokens: 40000',
+  ]);
+  const c = reconcileCompactionRow(caseC, compactionRatios(0.5));
+  const cLines = bodies(c.text);
+  check(
+    'F3 对账器 Case C：retainTokens 行被 retainRatio 顶掉（结果里绝不并存两种保留形式）',
+    c.changed === true && !c.text.includes('retainTokens')
+      && cLines.includes('        retainRatio: 0.1')
+      && cLines.includes('        thresholdRatio: 0.5'),
+    JSON.stringify(cLines.filter((line) => line.includes('Ratio') || line.includes('Tokens'))),
+  );
+
+  // F4 幂等：对自己的输出再跑一次，changed === false 且文本逐字节相同。
+  const again = reconcileCompactionRow(a.text, compactionRatios(0.5));
+  check(
+    'F4 对账器幂等：对自身输出再跑一次 changed=false、文本逐字节不变',
+    again.found === true && again.changed === false && again.text === a.text,
+  );
+
+  // F5 派生：保留恒为阈值的 1/5，且严格小于阈值（区间两端 0.05 / 0.8 都成立）。
+  const low = compactionRatios(0.05);
+  const high = compactionRatios(0.8);
+  check(
+    'F5 派生 retainRatio = thresholdRatio / 5 且严格小于阈值（0.05 与 0.8 两端都成立）',
+    low.thresholdRatio === 0.05 && low.retainRatio === Number((0.05 / 5).toFixed(4)) && low.retainRatio < low.thresholdRatio
+      && high.thresholdRatio === 0.8 && high.retainRatio === Number((0.8 / 5).toFixed(4)) && high.retainRatio < high.thresholdRatio
+      && compactionRatios(0.5).retainRatio === 0.1,
+    JSON.stringify({ low, high }),
+  );
+
+  // F6 字节保持：Case B 不改行数，行外每一行（含行尾符）必须逐行相同。
+  const bBefore = bodies(caseB);
+  const bAfter = bodies(b.text);
+  const rowStart = bBefore.indexOf('    - id: compaction-basic');
+  const rowEnd = bBefore.indexOf('    - id: command-compact');
+  check(
+    'F6 对账器只动 compaction-basic 行：行外所有行（含 CRLF 行尾）逐行相同',
+    rowStart !== -1 && rowEnd !== -1 && bAfter.length === bBefore.length
+      && bBefore.slice(0, rowStart).join('\n') === bAfter.slice(0, rowStart).join('\n')
+      && bBefore.slice(rowEnd).join('\n') === bAfter.slice(rowEnd).join('\n')
+      && b.text.includes('\r\n') && !b.text.replace(/\r\n/g, '').includes('\n'),
+  );
+
+  // F8 行尾注释：`config: # 注释` 仍是块风格（先剥注释再判定），不得误判为行内值。
+  const caseD = fixture([
+    '    - id: compaction-basic',
+    "      name: '@deepseek-ai/dsh-compaction-basic'",
+    '      config: # 压缩配置',
+    '        retainTokens: 40000',
+  ]);
+  const d = reconcileCompactionRow(caseD, compactionRatios(0.5));
+  check(
+    'F8 行尾注释的块风格 config:（先剥注释再判定）：注释保留、retainTokens 被顶成 retainRatio',
+    d.found === true && d.changed === true && d.unsupported === undefined
+      && d.text.includes('config: # 压缩配置')
+      && !d.text.includes('retainTokens')
+      && bodies(d.text).includes('        thresholdRatio: 0.5')
+      && bodies(d.text).includes('        retainRatio: 0.1'),
+    JSON.stringify(bodies(d.text).filter((line) => line.includes('config') || line.includes('Ratio') || line.includes('Tokens'))),
+  );
+
+  // F7 找不到该行：no-op 且明确报 not found，绝不改写文本。
+  const missing = fixture([
+    '    - id: command-compact',
+    "      name: '@deepseek-ai/dsh-command-compact'",
+  ]);
+  const notFound = reconcileCompactionRow(missing, compactionRatios(0.5));
+  check(
+    'F7 对账器找不到 compaction-basic 行：found=false / changed=false / 文本原样返回',
+    notFound.found === false && notFound.changed === false && notFound.text === missing,
+  );
+}
+
+// ── G. 设置 → 已安装预设组合的写入链（installSection → setSource → 对账 → 写盘）──────
+// F 只测纯函数；这里用假 settings（installSection 直接调 setSource）+ 各自的临时 DSH_HOME
+// 覆盖真正会写盘的那条路：0.3 → 0.3/0.06；组合缺失只告警不创建；没有该行只告警不改写；
+// 行内（flow）config: 与「锚点行没有行尾符」两种形状不得写出不可解析的字节（Issue 1/2）。
+{
+  const originalHome = process.env.DSH_HOME;
+  const installedPath = (home) => join(home, '.agent-presets', 'code-pipeline', 'agent.cordis.yml');
+  const readIfAny = (home) => (existsSync(installedPath(home)) ? readFileSync(installedPath(home), 'utf8') : undefined);
+  const bareHome = () => mkdtempSync(join(tmpdir(), 'dsh-code-pipeline-chain-'));
+  const writeHome = (text) => {
+    const home = bareHome();
+    mkdirSync(join(home, '.agent-presets', 'code-pipeline'), { recursive: true });
+    writeFileSync(installedPath(home), text, 'utf8');
+    return home;
+  };
+  // 走真实接线：apply 里的 installSection 会（同步）调用 setSource，从而触发对账写盘。
+  const applyAt = async (home, parentId, settings) => {
+    process.env.DSH_HOME = home;
+    const harness = createHarness(parentId);
+    Object.assign(harness.settings, settings);
+    await plugin.apply(harness.ctx, { preset: 'code-pipeline' });
+    return harness;
+  };
+  const settle = async (predicate) => {
+    for (let i = 0; i < 100; i += 1) {
+      if (predicate()) return true;
+      await tick(10);
+    }
+    return predicate();
+  };
+  const parses = (text) => {
+    try {
+      parse(text);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // G1 设置 0.3 → 已安装组合真的被写成 0.3 / 0.06（走 await writeFile 那条路）。
+  {
+    const home = bareHome();
+    await applyAt(home, 'parent-chain-write', { compactionThresholdRatio: 0.3 });
+    await settle(() => (readIfAny(home) ?? '').includes('thresholdRatio: 0.3'));
+    const text = readIfAny(home) ?? '';
+    check(
+      'G1 设置 compactionThresholdRatio=0.3 → 已安装组合被写成 thresholdRatio 0.3 / retainRatio 0.06',
+      text.includes('thresholdRatio: 0.3') && text.includes('retainRatio: 0.06') && !text.includes('retainTokens'),
+      (text.match(/thresholdRatio: \S+|retainRatio: \S+/g) ?? []).join(' | '),
+    );
+  }
+
+  // G2 组合文件缺失：只告警，绝不创建（安装是 ensurePresetInstalled 的职责，这里它是 incomplete）。
+  {
+    const home = bareHome();
+    mkdirSync(join(home, '.agent-presets', 'code-pipeline'), { recursive: true });
+    const harness = await applyAt(home, 'parent-chain-missing', { compactionThresholdRatio: 0.3 });
+    await tick(30);
+    check(
+      'G2 已安装组合缺失：只告警、不创建文件',
+      !existsSync(installedPath(home))
+        && harness.warnings.some((line) => line.includes('installed preset composition missing')),
+      JSON.stringify({ created: existsSync(installedPath(home)), warnings: harness.warnings.slice(-2) }),
+    );
+  }
+
+  // G3 组合里没有 compaction-basic 行：只告警，文件逐字节不变。
+  {
+    const noRow = [
+      '- id: persona',
+      "  name: '@deepseek-ai/dsh-persona'",
+      '- id: present',
+      "  name: '@deepseek-ai/dsh-tool-present'",
+      '',
+    ].join('\n');
+    const home = writeHome(noRow);
+    const harness = await applyAt(home, 'parent-chain-norow', { compactionThresholdRatio: 0.3 });
+    await tick(30);
+    check(
+      'G3 组合里没有 compaction-basic 行：只告警、文件逐字节不变',
+      readIfAny(home) === noRow
+        && harness.warnings.some((line) => line.includes('has no "- id: compaction-basic" row')),
+      JSON.stringify(harness.warnings.slice(-1)),
+    );
+  }
+
+  // G4 Issue 1：行内（flow）config: 必须 no-op——追加第二个 config: 键会让整份预设无法挂载。
+  {
+    const inlineRow = [
+      '- id: compaction',
+      '  name: cordis:group',
+      '  config:',
+      '    - id: compaction-basic',
+      "      name: '@deepseek-ai/dsh-compaction-basic'",
+      '      config: { thresholdRatio: 0.5, retainRatio: 0.1 }',
+      '    - id: command-compact',
+      "      name: '@deepseek-ai/dsh-command-compact'",
+      '',
+    ].join('\n');
+    const home = writeHome(inlineRow);
+    const harness = await applyAt(home, 'parent-chain-inline', { compactionThresholdRatio: 0.3 });
+    await tick(30);
+    const text = readIfAny(home) ?? '';
+    check(
+      'G4 行内（flow）config: → no-op：不追加第二个 config: 键、文件逐字节不变且仍可解析',
+      text === inlineRow && parses(text)
+        && !text.includes('thresholdRatio: 0.3')
+        && harness.warnings.some((line) => line.includes('inline (flow)')),
+      JSON.stringify({ unchanged: text === inlineRow, parses: parses(text), warnings: harness.warnings.slice(-1) }),
+    );
+  }
+
+  // G5 Issue 2：锚点行（这里是最后一行）没有行尾符——新块必须另起一行，写出的字节必须可解析。
+  {
+    const lastRowNoEol = [
+      '- id: compaction',
+      '  name: cordis:group',
+      '  config:',
+      '    - id: compaction-basic',
+      "      name: '@deepseek-ai/dsh-compaction-basic'",
+    ].join('\n');
+    const home = writeHome(lastRowNoEol);
+    await applyAt(home, 'parent-chain-lasteol', { compactionThresholdRatio: 0.3 });
+    await settle(() => (readIfAny(home) ?? '').includes('thresholdRatio: 0.3'));
+    const text = readIfAny(home) ?? '';
+    check(
+      'G5 锚点行没有行尾符（Issue 2）：新块另起一行、写出的字节仍可被解析',
+      parses(text)
+        && text.includes("      name: '@deepseek-ai/dsh-compaction-basic'\n      config:\n        thresholdRatio: 0.3\n        retainRatio: 0.06"),
+      JSON.stringify(text.slice(-140)),
+    );
+  }
+
+  process.env.DSH_HOME = originalHome;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
