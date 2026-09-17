@@ -1016,8 +1016,48 @@ const attemptFollowup = async (harness, child, message, compact) => {
     !presetText.includes('retainTokens'),
   );
   const persona = String(rows.find((row) => row?.id === 'persona')?.config?.prefix ?? '');
-  check('E4 扇出分级锚点在 persona 里（Right-size the pipeline）', persona.includes('Right-size the pipeline'));
-  check('E5 文档型工作流锚点在 persona 里（never one reviewer per workstream）', persona.includes('never one reviewer per workstream'));
+  check(
+    'E4 分档改为 T0/T1/T2 + 默认最小档 + 惰性升级（旧的 Right-size 措辞已消失）',
+    persona.includes('T0 — you do it in the main session. No stage at all.')
+      && persona.includes('T1 — you plan, the stages execute and verify.')
+      && persona.includes('T2 — the full build flow below.')
+      && persona.includes('Escalate lazily, and only upward.')
+      && !persona.includes('Right-size the pipeline before you dispatch anything'),
+  );
+  check(
+    'E5 并行写降级为例外（读/评审仍默认并行）',
+    persona.includes('parallel WRITES are the exception')
+      && persona.includes('Keep WRITES single-threaded by default')
+      && !persona.includes('Parallel dispatch is the default choice, not a last resort'),
+  );
+  check(
+    'E11 评审裁决策略锚点（机械白名单 + 拒绝理由留痕 + 无 blocker 即收尾）',
+    persona.includes('Triage the review before you fix anything')
+      && persona.includes('AND confidence >= 0.8')
+      && persona.includes('AND onChangedLines == true')
+      && persona.includes('intent-misalignment')
+      && persona.includes('The exit condition is "nothing must be fixed", not "the reviewer is satisfied".'),
+  );
+  // E12 的锚点在**阶段子代理的 persona**（lib/index.js 的 PERSONAS.review）里，不在预设主 persona 里：
+  // 反吹毛求疵的规则由 reviewer 自己执行，主代理只按白名单过滤（E11）。
+  const pluginSource = readFileSync(join(root, 'lib', 'index.js'), 'utf8');
+  check(
+    'E12 reviewer 契约锚点（无 failureScenario 不得 blocking；docs/style 永不 blocking；verdict 机械判定）',
+    pluginSource.includes('If you cannot state a concrete')
+      && pluginSource.includes('findings are NEVER blocking')
+      && pluginSource.includes('NEVER withhold an approve verdict over a non-blocking finding'),
+  );
+  check(
+    'E13 收敛锚点（封闭复验 + 伪 bug 循环即停 + 3 轮是保险丝）',
+    persona.includes('Do not open new findings.')
+      && persona.includes('pseudo-bug-fix cycle')
+      && persona.includes('fuse, not a target'),
+  );
+  check(
+    'E14 宿主存活容量上限写进 persona（0.1.6-alpha.2 的 persona 缺口）',
+    persona.includes('subagent.maxActiveSubagents')
+      && persona.includes('TRANSIENT CAPACITY REJECTION'),
+  );
   check('E6 冷子代理锚点在 persona 里（A cold child cannot be compacted）', persona.includes('A cold child cannot be compacted'));
   check(
     'E7 评审第 2 轮只送增量：新锚点在、旧的 FULL NEW diff 措辞已消失',

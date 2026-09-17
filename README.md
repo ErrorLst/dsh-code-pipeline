@@ -342,9 +342,10 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   结论：`maxConcurrency: 0`（不限制）只解除了**本插件**的限制，实际并行度仍受
   `maxActiveSubagents`（默认 8）与 `run_code` 的 `maxParallelSubCalls`（默认 10）约束。
   `/dsh-code-pipeline/status` 会返回 `hostActiveSubagentLimit` 字段（宿主未注册该命名空间时不返回）。
-- **预设侧的并行偏好 + 「每个独立工作流至多创建一次」**：`code-pipeline` 预设的
-  pipeline protocol 要求「独立目标优先在一个程序里并行派发多个阶段子代理以加快进度」，
-  并说明超限拒绝是瞬时的、不是阶段失败；（0.2.0 起）**每个独立 workstream 至多创建一次**：
+- **预设侧的并行立场（0.3.0 起反转）+ 「每个独立工作流至多创建一次」**：`code-pipeline` 预设的
+  pipeline protocol 现在是**写入串行为默认**、并行只用于「读 / 分析 / 评审」，并行 impl 必须同时满足
+  「文件不重叠 + 真正独立 + 各自可机器校验 + T2 规模」（研究：并行写手各自做隐式决策，结果会冲突，
+  且智能体数量增加收益递减）；超限拒绝是瞬时的、不是阶段失败；（0.2.0 起）**每个独立 workstream 至多创建一次**：
   第一轮用 `subagent_impl`，之后（评审问题、改需求、墙钟续跑）一律用 `pipeline_followup`
   回到那个子代理；并行的创建数受该阶段**创建上限**约束，超出上限时改为复用（不带 `compact` 地投递、接受干扰），而不是继续创建。
 
@@ -487,7 +488,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
   workstream；共享串行点（`package.json`、lockfile、`index`/barrel、迁移、生成物）收进最后一个 `integration`
   workstream（依赖其余）；一个 workstream 必须值得独占一个子代理（大致 >1 个文件或 >15 分钟），不要把一件
   连贯的改动静默拆成无法各自验证的碎片；每个 workstream 自带验收检查。
-- **主代理（预设 persona）**：当计划声明 ≥2 个「文件不相交且无依赖」的 workstream 时，**在一个程序里并行派发**
+- **主代理（预设 persona）**：当计划声明 ≥2 个「文件不相交且无依赖」的 workstream、**且任务属 T2**（并行写是例外而非默认）时，可以在一个程序里并行派发
   每个独立 workstream **至多一个** `subagent_impl`（`Promise.all`，并行度受该阶段**创建上限**约束：
   超出上限时改为用 `pipeline_followup` 复用已有子代理（不带 `compact` 地投递、接受干扰），而不是继续创建）；
   有依赖或共享文件的顺序执行，`integration` 最后跑。
@@ -499,6 +500,15 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.0（协议分档重写 T0/T1/T2 + 评审分级裁决 + 循环收敛；只改协议文本，无插件逻辑改动）**：
+  - **问题**：① 分档表虽然存在（Trivial/Small/Documentation-only/Standard/Large），但被三条更强的 ALL-CAPS 不变式压过——`every planned change (even a trivial one) goes through the impl stage`、`Never fix review issues yourself`，加上 Small 的「用户观察不到行为变化」定义极窄，导致两文件的行为修复也走完整 plan→gate→impl→review；而且**没有 T1 档**（主会话自己规划 + impl→review），中间形态掉进缝里。② reviewer 只被要求「文件 + 问题 + 建议修法」，`Never approve with unresolved material defects` 里的 material 无法执行；编排协议又禁止主会话做任何判断，review 的 issue 原样全量交给 impl——于是只要 reviewer 每轮再提一条就必然跑满 3 轮、永远看不到 APPROVED；而「最多 3 轮」本身也没有任何机制执行（插件不记轮次）。
+  - **分档改为 T0/T1/T2**：T0（≲60 行 / ≤2 文件 / 文档注释 / 机械操作 / 单点无设计决策）主会话直接做、不起子代理；T1（3–8 文件，或 ~60–500 行，单子系统且设计已由需求定死）由主会话自己写计划放进 `plan` 字段，只派 impl→review；T2 才走完整流程。新增**惰性升级**（从 T0 开始，命中触发条件才升级；升级单向且必须 `todo_write` 留痕）与**允许降级**；并明确「T0 不等于跳过验证」（改完自己跑测试/构建）。三条压制分档的不变式同步改写。
+  - **并行写降级为例外**：研究（Cognition「Don't Build Multi-Agents」与其 2026 复盘、Anthropic 多智能体研究、Adversarial Review ICML 2026）一致显示并行写手各自做隐式决策、结果会冲突，且智能体数量增加收益递减。协议改为「并行只用于读 / 分析 / 评审；并行 impl 必须同时满足文件不重叠 + 真正独立 + 各自可机器校验 + T2 规模」。
+  - **评审分级 + 主会话裁决**：reviewer 必须输出结构化 `review` envelope（`verdict` / `severityCounts` / `blockingCount` / `issues[]` / `outOfScope[]`），每条 issue 带 `severity / blocking / category / confidence / onChangedLines / failureScenario / evidence / suggestedFix / objectiveCheck`；8 条硬约束里最关键的是**写不出 `failureScenario` 就不得 blocking**、**`docs` / `style` 永不 blocking**、**不在改动行上永不 blocking**、**verdict 由 findings 机械决定**（取代 material defects 这种主观措辞）。主代理只做**白名单过滤**（`blocking` + `critical/high` + `confidence ≥ 0.8` + `onChangedLines`），被过滤的必须带 `rejectionReason` 留痕并在报告里列出；**过滤后为空即收尾**，不再等 APPROVED。
+  - **循环收敛**：3 轮从「目标」变成「保险丝」；新增**封闭复验**（「#1..#n 是否已解决？不要开新 finding」，取代开放式「再评审一遍」）与**无进展即停**（blocking 数未严格下降 / 同一 finding 修后重开 / delta 为空 → 交用户决策）；客观信号（测试、类型检查）优先于 LLM 意见。
+  - **补上 persona 缺口**：dsh 0.1.6-alpha.2 的宿主「同时存活子代理」容量上限（`subagent.maxActiveSubagents`，默认 8）此前只写在工具 description 里，这次写进协议，并明确它是**瞬时容量拒绝，不是阶段不可用**。
+  - **测试**：`test/watchdog.smoke.mjs` 的 E 块把 E4/E5 换成新锚点，新增 E11–E14（分档 / 并行 / 裁决 / 反吹毛求疵 / 收敛 / 宿主容量）。断言数 **174 → 178**、0 failure；修改后的预设在真实 DSH 组合里挂载成功、0 错误。
+  - 本版**只改协议文本**（`preset/code-pipeline/agent.cordis.yml`、`lib/index.js` 的 persona 与工具 description、README），**没有动任何插件逻辑**；结构化 I/O（`pipeline_submit` / `pipeline_result`）留给后续阶段。
 - **0.2.5（预设简介收窄到 20 字以内）**：
   - **问题**：`preset/code-pipeline/preset.yml` 的 `description` 有 600+ 字——模式、三个工具、组合方式、Workstreams、墙钟、复用、容量上限全塞进同一句，Agent preset 选择器里糊成一大段，扫一眼读不完。
   - **做法**：压到 **18 字** —— `规划→实现→评审的三阶段子代理流水线`。细节本来就在 README（安装、并发上限、墙钟预算、`pipeline_followup`、压缩触发比例）与 Settings → 代码流水线 里；选择器只需要回答「这是什么」。
