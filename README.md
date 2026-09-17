@@ -418,7 +418,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 166 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 167 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -481,6 +481,10 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.2.3（补一条协议规则 + 一条断言：评审第 2 轮起「只送增量」必须先有「每轮快照」才可执行）**：
+  - **问题（本插件自己的 0.2.2 评审循环暴露的）**：0.2.2 已把「评审后续轮只送自上次裁决以来发生变化的 hunk」写进协议，但那条规定**不可执行**——没有任何东西保留上一轮的文件状态，能拿到的只有 `git diff HEAD` 的累积 patch，于是三轮评审都只能收到累积 patch，体量单调增长 **41,845 → 48,795 → 56,527 个字符**，同一批 hunk 被重复送进同一个评审子代理的上下文。
+  - **做法**：在预设的「Repeat review rounds reuse the SAME reviewer」小节里、导语与编号列表之间新增一段**快照协议**：每轮 impl settle 之后，把所有改动过的路径按轮次拷进平台临时根下的目录 —— `$TMPDIR/dsh-pipeline-snap/<task>/round<N>/<原始相对路径>` —— 下一轮的增量用 `diff -ruN <round1>/ <round2>/`（或 `git diff --no-index`）生成，并限定在该任务的路径范围内；**快照绝不写进工作区**。同一条规则也追加进 Build flow 第 4 步（Review）末尾：评审前捕获变更集时顺手快照，下一轮才能送增量而不是累积 patch。
+  - **测试**：`test/watchdog.smoke.mjs` 的 E 块新增 **E10**（persona 同时含 `dsh-pipeline-snap` 与 `Never write the snapshots inside the workspace` 两个锚点）。断言数 **167**、0 failure（本版新增 **1** 项）。
 - **0.2.2（压缩触发线变成运行时设置 `压缩触发比例` + 三处流水线策略 + 对账器 / 测试 / 文档）**：
   - **改动面**：`preset/code-pipeline/agent.cordis.yml`（压缩行的出厂默认 + 三处策略文本）、`lib/index.js`（新设置项 `compactionThresholdRatio` 与把它写进已安装组合的对账器）、`lib/client.js`（设置卡片新增「压缩触发比例」输入框）、`test/watchdog.smoke.mjs`、本 README；`preset/code-pipeline/preset.yml` 不动。
   - **问题 1（触发线按模型窗口定，等于永不触发）**：`compaction` 组里的 `compaction-basic` 行原先**没有 `config:`**，于是吃宿主默认 `thresholdRatio: 0.8`——对 100 万 token 的窗口就是 **80 万**才触发。全库审计（`~/.dsh/deepseek-quota/quota.db`，446 会话 / 28,775 请求，每个样本按它自己的峰谷价计价）先看这批历史数据的**构成**：
@@ -514,14 +518,14 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
   - **做法 3（后续轮只送增量 hunk）**：该条改为只送「**自该评审上一次裁决以来发生变化的 hunk**」（`git diff HEAD -- <本次修复触及的路径>`，或直接给具体 hunk）；只有整份改动被重写时才重发累积 patch，而且 `compact: true` 对**已 settle 的评审子代理**不可用（见上文冷子代理边界），所以要么再付一份拷贝的钱，要么——仅当本会话仍有创建名额——改派一个新的评审子代理。第 1 轮的 `subagent_review` 仍必须带完整 patch（插件强制校验 `@@` hunk 头），不改。
   - **问题 4（冷子代理不能压缩，但协议没写）**：压缩是冲着**活着的 agent 对象**做的，所以 `dsh` 重启后本会话的每个子代理都是冷的（实测本次会话 34 个子代理全部 `ready`）：`compact: true` 被拒（`cannot compact <id> — that child is not awake in this process`）、**什么都没投递**、目标收件箱不变。
   - **做法 4（把边界写进 persona）**：在压缩的四条可判定判据之后新增一段，明确这是**宿主 API 的已知边界——不是阶段失败、也不是 UNAVAILABLE 情形**：它**不**表示不能复用（不带 `compact` 的 `pipeline_followup` 照常冷启动续用）；**不要**让这次拒绝本身把你推去新派子代理（创建上限数的是创建数，新派也可能被拒），也绝不因此停任务——两条宿主约束**结构性互斥**：压缩需要**活着的 agent**，而活着的 agent 要么正在回合中（`compactNow` 抛 `busy`），要么刚被一次投递冷唤醒、inbox 已经满了；**唤醒也救不了**（子代理答完就回到冷态）。实测本安装 16 次压缩（11 次手动 `/compact` + 5 次自动）**没有一次属于阶段子代理**，`compact: true` 在复用流程里从未成功过。所以复用时按「`compact: true` 不可用」处理：**接受干扰，或——仅当本会话仍有创建名额——改派新子代理，并明确说出选了哪一个**。
-  - **测试**：`test/watchdog.smoke.mjs` 新增 **E. 预设内容契约** 9 条断言（E1 预设可被 `yaml` 解析；E2 出厂默认 `thresholdRatio = 0.5` 且 `retainRatio = 0.1`；E3 宿主加载期不变式 `retainRatio < thresholdRatio`；E8 预设绝不出现 `retainTokens`；E4/E5/E6 三个策略锚点仍在 persona 里；E7 第 2 轮增量锚点在、旧的「the FULL NEW diff captured at this moment」已消失；E9 冷子代理边界改后的第 3 条锚点在 persona 里）、**F. 压缩触发比例对账器** 8 条断言（Case A 无 `config:` 补块（插在 `name:` 之后）、Case B 已有键就地替换、Case C `retainTokens` 被 `retainRatio` 顶掉、幂等、`retainRatio = thresholdRatio / 5` 且区间两端 0.05 / 0.8 都严格小于阈值、行外逐行不变（含 CRLF）、行尾注释仍算块风格、找不到该行时 no-op 报 not found）与 **G. 设置 → 已安装预设组合的写入链** 5 条断言（G1 设置 `0.3` → 组合被写成 `0.3`/`0.06`（唯一走 `await writeFile` 的路径）；G2 组合缺失只告警、不创建文件；G3 没有该行只告警、文件不变；G4 行内（flow）`config:` 一律 no-op、不追加第二个 `config:` 键；G5 锚点行没有行尾符时新块另起一行、写出的字节仍可解析）。断言数 **166**、0 failure（本版新增 **22** 项）。
+  - **测试**：`test/watchdog.smoke.mjs` 新增 **E. 预设内容契约** 9 条断言（E1 预设可被 `yaml` 解析；E2 出厂默认 `thresholdRatio = 0.5` 且 `retainRatio = 0.1`；E3 宿主加载期不变式 `retainRatio < thresholdRatio`；E8 预设绝不出现 `retainTokens`；E4/E5/E6 三个策略锚点仍在 persona 里；E7 第 2 轮增量锚点在、旧的「the FULL NEW diff captured at this moment」已消失；E9 冷子代理边界改后的第 3 条锚点在 persona 里）、**F. 压缩触发比例对账器** 8 条断言（Case A 无 `config:` 补块（插在 `name:` 之后）、Case B 已有键就地替换、Case C `retainTokens` 被 `retainRatio` 顶掉、幂等、`retainRatio = thresholdRatio / 5` 且区间两端 0.05 / 0.8 都严格小于阈值、行外逐行不变（含 CRLF）、行尾注释仍算块风格、找不到该行时 no-op 报 not found）与 **G. 设置 → 已安装预设组合的写入链** 5 条断言（G1 设置 `0.3` → 组合被写成 `0.3`/`0.06`（唯一走 `await writeFile` 的路径）；G2 组合缺失只告警、不创建文件；G3 没有该行只告警、文件不变；G4 行内（flow）`config:` 一律 no-op、不追加第二个 `config:` 键；G5 锚点行没有行尾符时新块另起一行、写出的字节仍可解析）。断言数 **166**、0 failure（本版新增 **22** 项；0.2.3 起总计 **167**）。
   - **如何确认生效**：`grep -A3 'compaction-basic' ~/.dsh/.agent-presets/code-pipeline/agent.cordis.yml` 应显示设置页配置的那一对（默认 `thresholdRatio: 0.5` / `retainRatio: 0.1`）；改完设置后**新派发的阶段子代理**在下一次派发即用新值（新会话同理），**当前主会话**需重选一次预设或重启 dsh。
 - **0.2.1（修 0.2.0 的一处计数 bug：无阶段归属的旧子代理被误算进每一个阶段桶）**：
   - **问题**：`mergeStageRows` 的过滤条件写成 `stageKey !== undefined && row.stage !== undefined && row.stage !== stageKey`——只在归属**已知**时才比较阶段，于是**归属为 undefined 的行会被算进每一个阶段**。0.2.0 之前创建的旧子代理正是这种行（label 没有 `<stage>/` 前缀、不是 live、进程内台账里更没有）。实测症状：某会话 10 个旧子代理把 **plan** 桶顶到 `limit` 之上——用户只创建过 1 个规划子代理却被拒，且这 10 个还被列成"可复用"（实际又寻址不到：`resolveFollowupTarget` 只认有归属的行）⇒ **既不能复用也不能新建，阶段卡死**。同一份虚高还会被 `noteCreatedObservation` 记成只增不减的「高水位」，从此永久污染该阶段。
   - **做法**：`mergeStageRows` 对**宿主行**改为精确匹配（`row.stage !== stageKey` 即跳过），无归属的行被排除在所有阶段桶之外；`knownStageRows` 改为走该函数注释里本就写明的 `undefined` 模式（它合并的两个来源都已按阶段过滤过、且合并输出会丢弃 `stage` 字段——若传 `stageKey`，严格匹配会把这批行整批丢掉，拒绝文案的兜底清单就空了）。
   - **边界不变**：无归属的旧子代理**仍不计入上限、也不可复用**（本次不改变该边界）；要按精确 id 复用它们需要另做寻址增强，未做。
   - **生效条件（高水位是纯进程内状态，离线替换文件无效）**：`createdObservation` 是模块级 `Map`，单调只增、**不落盘**，全文件只有读写三处、**没有任何 `delete` / `clear` 路径** ⇒ 进程内没有自愈路径；0.2.0 期间被顶高的桶只有**重载 / 重启 dsh**（重新加载本版 `lib`）才会清零。**离线替换 profile 里的文件对已加载的模块无效**，所以「装上 0.2.1」本身不构成生效条件——必须重启。
-  - **测试**：新增 F1 三条断言（`cap=1` 且持久面有 3 行无归属标签时仍能新派第一个；**先结束第 1 个**、第 2 个必须撞**创建**闸门（拒绝文案带该子代理 id），证明计数是 1 而不是 1+3；无归属行仍不可寻址）。断言数 141 → **166**（其中 0.2.1 新增 3 项、0.2.2 新增 **22** 项）、0 failure。变异验证：把过滤条件改回旧写法后 F1 第 ① 条必红并报出生产同款文案；停掉创建计数台账后 F1 第 ② 条必红——之所以让它先结束第 1 个，正是为了让这条断言只对「创建计数」敏感：第 1 个仍在跑时拦下第 2 次派发的是**运行**闸门（`stage concurrency limit reached`），那句文案与计数无关，对「计数是 1 而不是 1+3」零鉴别力。
+  - **测试**：新增 F1 三条断言（`cap=1` 且持久面有 3 行无归属标签时仍能新派第一个；**先结束第 1 个**、第 2 个必须撞**创建**闸门（拒绝文案带该子代理 id），证明计数是 1 而不是 1+3；无归属行仍不可寻址）。断言数 141 → **167**（其中 0.2.1 新增 3 项、0.2.2 新增 **22** 项、0.2.3 新增 **1** 项）、0 failure。变异验证：把过滤条件改回旧写法后 F1 第 ① 条必红并报出生产同款文案；停掉创建计数台账后 F1 第 ② 条必红——之所以让它先结束第 1 个，正是为了让这条断言只对「创建计数」敏感：第 1 个仍在跑时拦下第 2 次派发的是**运行**闸门（`stage concurrency limit reached`），那句文案与计数无关，对「计数是 1 而不是 1+3」零鉴别力。
 - **0.2.0（复用优先从"劝说"升级为硬机制：创建数量上限 + 压缩后复用）**：
   - **问题**：阶段子代理都从空会话起步，同一任务的多轮（改需求、多轮评审、墙钟续跑）每轮新开
     一个子代理 ⇒ 会话数暴涨、每轮重复付 system/persona/派发消息的钱，而且新会话**没有前缀

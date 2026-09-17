@@ -951,6 +951,10 @@ const attemptFollowup = async (harness, child, message, compact) => {
     'E9 冷子代理边界改后的第 3 条锚点在 persona 里（唤醒也救不了）',
     persona.includes('there is no way to compact a settled child, and waking it does not help'),
   );
+  check(
+    'E10 评审快照协议锚点在 persona 里（dsh-pipeline-snap + 不写进工作区）',
+    persona.includes('dsh-pipeline-snap') && persona.includes('Never write the snapshots inside the workspace'),
+  );
 }
 
 // ── F. 压缩触发比例对账器（reconcileCompactionRow，纯函数，可离线单测）──────────
