@@ -417,7 +417,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 90 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 144 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -442,7 +442,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 **宿主改写文案时仍能回退**（`message` 不再以 `invalid payload for subagent.prompt` 开头、
 但 `details.issues` 仍在 → OR 兜底照常继续探测并成功投递）。
 
-0.2.0 起断言数 36 → **90**（新增 54 项），分四类：
+0.2.0 起断言数 36 → **141**（新增 105 项），分四类：
 **A. 创建数量硬闸门**——`cap=1` 时第 1 个派发成功、第 2 个（第 1 个仍在跑）被**运行上限**拦下、
 子代理结束、running 归零后第 3 个仍被**创建上限**拦下（数的是「已创建」而不是「在跑」）、
 三种被拒路径下宿主创建入口 `startContinuable` 始终只被调用 1 次（证明是代码拦下的）、
@@ -480,6 +480,12 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.2.1（修 0.2.0 的一处计数 bug：无阶段归属的旧子代理被误算进每一个阶段桶）**：
+  - **问题**：`mergeStageRows` 的过滤条件写成 `stageKey !== undefined && row.stage !== undefined && row.stage !== stageKey`——只在归属**已知**时才比较阶段，于是**归属为 undefined 的行会被算进每一个阶段**。0.2.0 之前创建的旧子代理正是这种行（label 没有 `<stage>/` 前缀、不是 live、进程内台账里更没有）。实测症状：某会话 10 个旧子代理把 **plan** 桶顶到 `limit` 之上——用户只创建过 1 个规划子代理却被拒，且这 10 个还被列成"可复用"（实际又寻址不到：`resolveFollowupTarget` 只认有归属的行）⇒ **既不能复用也不能新建，阶段卡死**。同一份虚高还会被 `noteCreatedObservation` 记成只增不减的「高水位」，从此永久污染该阶段。
+  - **做法**：`mergeStageRows` 对**宿主行**改为精确匹配（`row.stage !== stageKey` 即跳过），无归属的行被排除在所有阶段桶之外；`knownStageRows` 改为走该函数注释里本就写明的 `undefined` 模式（它合并的两个来源都已按阶段过滤过、且合并输出会丢弃 `stage` 字段——若传 `stageKey`，严格匹配会把这批行整批丢掉，拒绝文案的兜底清单就空了）。
+  - **边界不变**：无归属的旧子代理**仍不计入上限、也不可复用**（本次不改变该边界）；要按精确 id 复用它们需要另做寻址增强，未做。
+  - **生效条件（高水位是纯进程内状态，离线替换文件无效）**：`createdObservation` 是模块级 `Map`，单调只增、**不落盘**，全文件只有读写三处、**没有任何 `delete` / `clear` 路径** ⇒ 进程内没有自愈路径；0.2.0 期间被顶高的桶只有**重载 / 重启 dsh**（重新加载本版 `lib`）才会清零。**离线替换 profile 里的文件对已加载的模块无效**，所以「装上 0.2.1」本身不构成生效条件——必须重启。
+  - **测试**：新增 F1 三条断言（`cap=1` 且持久面有 3 行无归属标签时仍能新派第一个；**先结束第 1 个**、第 2 个必须撞**创建**闸门（拒绝文案带该子代理 id），证明计数是 1 而不是 1+3；无归属行仍不可寻址）。断言数 141 → **144**、0 failure。变异验证：把过滤条件改回旧写法后 F1 第 ① 条必红并报出生产同款文案；停掉创建计数台账后 F1 第 ② 条必红——之所以让它先结束第 1 个，正是为了让这条断言只对「创建计数」敏感：第 1 个仍在跑时拦下第 2 次派发的是**运行**闸门（`stage concurrency limit reached`），那句文案与计数无关，对「计数是 1 而不是 1+3」零鉴别力。
 - **0.2.0（复用优先从"劝说"升级为硬机制：创建数量上限 + 压缩后复用）**：
   - **问题**：阶段子代理都从空会话起步，同一任务的多轮（改需求、多轮评审、墙钟续跑）每轮新开
     一个子代理 ⇒ 会话数暴涨、每轮重复付 system/persona/派发消息的钱，而且新会话**没有前缀
@@ -509,7 +515,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
        续跑改写的 `entry.at`，「最近派发」在续跑后会漂移）。
     5. **status 端点新增** `created`（已创建数）与 `available`（可复用子代理数组
        `{ id, label, activity }`）；设置卡片显示「当前运行 N / 上限 M / 已创建 K」+ 可复用清单。
-  - **测试**：`test/watchdog.smoke.mjs` 从 36 项扩到 **90 项断言，0 failure(s)**（新增 54 项：
+  - **测试**：`test/watchdog.smoke.mjs` 从 36 项扩到 **141 项断言，0 failure(s)**（新增 105 项：
     创建闸门机制 / 压缩顺序与失败路径 / 别名稳定 / status 字段）。
   - **已知边界（如实记录）**：
     - **旧子代理无法回溯**：本轮之前创建的子代理重启后既没有 `<stage>/` label 前缀、也没有

@@ -920,6 +920,48 @@ const statusOfHarness = async (harness) => {
 /** 从「创建上限拒绝」文案里抽出可复用清单的 id（走文案而不是硬编码常量）。 */
 const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^"]*"\s+\[(?:running|inactive)\]/g)].map((match) => match[1]);
 
+// ── F1. 无阶段归属的旧子代理（0.2.0 之前创建：label 无 `<stage>/` 前缀、非 live、台账空）──
+// 修前 `mergeStageRows` 只在 `row.stage !== undefined` 时才比较阶段，于是归属 undefined 的行会
+// **漏进每一个阶段桶**：用户实测 10 个旧子代理把 plan 桶顶到 limit 之上（他只创建过 1 个规划
+// 子代理就被拒），同时它们又进不了可复用清单（`resolveFollowupTarget` 只认有归属的行）
+// ⇒ 既不能复用也不能新建 = 阶段卡死。修复后它们必须被**排除在所有阶段桶之外**。
+{
+  const f1 = await newHarness('parent-f1', capFor({ plan: 1, impl: 1, review: 1 }));
+  f1.host.rows = persistRows([
+    ['legacy-1', 'W1 infra scaffold'],
+    ['legacy-2', 'review A'],
+    ['legacy-3', 'plan frontend scaffold'],
+  ]);
+  // 注意：不能用 status 断言——它是跨父会话的**全局聚合**，会被同进程其它 harness 的子代理污染。
+  // 这里用行为式断言，天然按父会话隔离。
+  const allowed = await attempt(f1, 'subagent_impl', { description: 'fresh work beside the legacy children' });
+  check(
+    'F1 无归属的旧子代理不计入创建数：cap=1 仍能新派第一个（修前会被这 3 行误判成「已创建 3」而拒）',
+    allowed.ok === true,
+    JSON.stringify(allowed).slice(0, 260),
+  );
+  // 必须先让第 1 个结束（同 A3）：否则拦下第 2 次派发的是**运行**闸门——它和第 1 个
+  // 是否被「创建」计数毫无关系，断言就失去了对"计数是 1 而不是 1+3"的鉴别力（停掉创建
+  // 计数台账它照样绿）。结束之后运行闸门放行，撞上的才是**创建**闸门，而它的文案自带
+  // 可复用清单，能同时钉住"这个真实子代理确实被计数"。
+  const firstId = allowed.result?.subagentId;
+  f1.emit('subagent/end', { id: firstId });
+  const second = await attempt(f1, 'subagent_impl', { description: 'second impl for the same parent' });
+  check(
+    'F1 但真实创建仍被计数：第 1 个结束后第 2 个 impl 仍被创建闸门拒绝（证明计数是 1 而不是 1+3）',
+    second.ok === false
+      && /stage CREATION limit reached/i.test(second.message ?? '')
+      && (second.message ?? '').includes(String(firstId)),
+    JSON.stringify(second).slice(0, 260),
+  );
+  const noAddr = await attemptFollowup(f1, 'legacy-1', 'continue the legacy child');
+  check(
+    'F1 边界保持不变：无归属的旧子代理仍不可寻址（本次不做该增强，属已知边界）',
+    noAddr.ok === false && /no stage subagent matches/i.test(noAddr.message ?? ''),
+    JSON.stringify(noAddr).slice(0, 260),
+  );
+}
+
 // ── P1. 重启后寻址：上限看得见 + 寻址也看得见（修前：不能复用也不能新建 = 阶段卡死）──
 {
   const p1 = await newHarness('parent-p1', capFor({ impl: 1 }));
