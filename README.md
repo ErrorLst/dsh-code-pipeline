@@ -34,6 +34,12 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   「STOP and report to the user」指令,预设 persona 的 invariants 也硬性规定
   主代理**不得自己接手任务**（不代做实现/规划/审查、不换路由、不找替身),
   而是告知用户原因并等待决定。
+  **例外（不算阶段不可用，不得终止任务）**：插件自己的三道**策略闸门**与宿主的
+  「同时存活子代理」容量上限——运行并发超限、创建总量超限、创建数暂时无法核实、
+  宿主 `ACTIVATION_LIMIT_REACHED` / `subagent/delivery-unavailable`（dsh
+  0.1.6-alpha.2 起）。这些是**瞬时**拒绝，阶段本身健康；错误文案会明确写
+  「NOT stage unavailability」并给出复用 / 等待后重试的出路（见
+  「每阶段并发上限与并行派发」）。
 
 ## 中途改需求：pipeline_followup（插入，不排队）
 
@@ -324,6 +330,18 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   代理不经过阶段工具，不受此限；创建数的计数是「本进程台账 ∪ 宿主当前可见行」，dsh 重启后
   由宿主接手——但**本轮之前**创建、既没有 `<stage>/` label 前缀也没有 `stageKey` 的旧
   子代理无法回溯归属：它们既不计入创建数、也不进复用清单。
+- **宿主还有一层「同时存活」容量上限（dsh 0.1.6-alpha.2 起）**：宿主为每个会话（root）
+  维护一个共享的 continuable 子代理名额池，大小 = `subagent.maxActiveSubagents`（**默认 8**，
+  可在 Settings → 内置插件 → 子代理 调大）。它与本插件的两道闸门**互相独立**：
+  - 它数的是**同时存活**的子代理（跨阶段、跨本插件，含其它来源的子代理），
+    **子代理结束即释放**——这一点与「已创建总量」正好相反；
+  - 名额用尽时派发会被宿主拒绝（`ACTIVATION_LIMIT_REACHED`），错误文案由插件改写成
+    「宿主容量耗尽」的**瞬时**拒绝（不是阶段不可用）：主代理应等待/复用，而不是终止任务；
+  - 唤醒一个已 settle 的冷子代理（`pipeline_followup`）同样需要名额；给**仍在运行**的子代理
+    插话不需要，所以名额紧张时优先 steer 运行中的孩子。
+  结论：`maxConcurrency: 0`（不限制）只解除了**本插件**的限制，实际并行度仍受
+  `maxActiveSubagents`（默认 8）与 `run_code` 的 `maxParallelSubCalls`（默认 10）约束。
+  `/dsh-code-pipeline/status` 会返回 `hostActiveSubagentLimit` 字段（宿主未注册该命名空间时不返回）。
 - **预设侧的并行偏好 + 「每个独立工作流至多创建一次」**：`code-pipeline` 预设的
   pipeline protocol 要求「独立目标优先在一个程序里并行派发多个阶段子代理以加快进度」，
   并说明超限拒绝是瞬时的、不是阶段失败；（0.2.0 起）**每个独立 workstream 至多创建一次**：

@@ -67,7 +67,10 @@ function createHarness(parentId = 'parent-1') {
     //   order          —— 跨服务统一调用序列（压缩必须早于投递）；
     //   serviceForArgs —— agentPresets.serviceFor 的实参（realm 私有 compression 服务寻址）；
     //   compactNowArgs —— compactNow 的实参（第一个实参必须是目标子代理对象）。
-    start: 0, order: [], serviceForArgs: [], compactNowArgs: [] };
+    start: 0, order: [], serviceForArgs: [], compactNowArgs: [],
+    // 宿主容量拒绝模拟（dsh 0.1.6-alpha.2）：startFailure / promptFailure 非空时，
+    // 对应入口抛出该错误对象，用于断言「瞬时容量拒绝」与「阶段不可用」的分流。
+    startFailure: null, promptFailure: null };
   let childSeq = 0;
 
   const toolsRegistry = { register: (def) => tools.set(def.name, def) };
@@ -126,6 +129,9 @@ function createHarness(parentId = 'parent-1') {
       calls.startSignals.push(spec.signal);
       calls.start += 1;
       calls.order.push('startContinuable');
+      // 容量拒绝发生在 reserve 阶段（宿主 continuation-activation.ts:41-55），
+      // 也就是任何子代理出现之前——假宿主照做：不建行、直接抛。
+      if (calls.startFailure) throw calls.startFailure;
       childSeq += 1;
       const childId = 'child-' + harnessNo + '-' + childSeq;
       // 宿主把 descriptor.label 原样写进持久面（listChildren.label）：假宿主照做，
@@ -174,6 +180,9 @@ function createHarness(parentId = 'parent-1') {
         error.details = { issues: [{ code: 'invalid_literal', path: ['delivery'] }] };
         throw error;
       }
+      // 冷启动容量拒绝（宿主 continuation.ts:436 -> control.ts:139 映射为
+      // 'subagent/delivery-unavailable'）：必须在判定接受之前抛，queued 不留痕。
+      if (calls.promptFailure) throw calls.promptFailure;
       calls.promptSignals.push(signal);
       queued.push(payload);
       return { messageId: 'msg-1' };
@@ -646,6 +655,74 @@ const attemptFollowup = async (harness, child, message, compact) => {
   for (let i = 0; i < 3; i += 1) results.push(await attempt(zero, 'subagent_impl', { description: 'unlimited ' + i }));
   check('A4 maxConcurrency=0：连派 3 个同阶段子代理全部成功', results.every((row) => row.ok === true), JSON.stringify(results.map((row) => row.ok)));
   check('A4 上限 0 = 不限制：宿主创建入口被调用 3 次', zero.calls.start === 3, 'start ' + zero.calls.start);
+}
+
+// ── A8 宿主「同时存活 continuable 子代理」容量拒绝（dsh 0.1.6-alpha.2 新增）──────
+// 宿主为每个 root 共享一个 ActivationPool（subagent.maxActiveSubagents，默认 8），
+// 名额用尽时 startContinuable 抛裸 SubagentError(ACTIVATION_LIMIT_REACHED)、冷启动
+// 投递被映射成 RemoteError('subagent/delivery-unavailable')。两者都是**瞬时容量
+// 拒绝**：文案必须像运行/创建上限那样叮嘱「等名额释放后复用或重试」，绝不能带
+// UNAVAILABLE 指引（那会让主代理终止整个任务）。
+{
+  const hostCap = await newHarness('parent-host-cap', capStages(0));
+  const activationError = new Error('subagent limit reached (active child limit: 8); wait for an existing child to finish or complete this work with the current agents');
+  activationError.code = 'ACTIVATION_LIMIT_REACHED';
+  hostCap.calls.startFailure = activationError;
+  const refused = await attempt(hostCap, 'subagent_impl', { description: 'host capacity' });
+  check('A8 宿主 ACTIVATION_LIMIT_REACHED：派发被拒（不是静默放行）', refused.ok === false, JSON.stringify(refused).slice(0, 200));
+  check(
+    'A8 文案是「宿主容量耗尽」而不是阶段不可用（没有 UNAVAILABLE 指引横幅）',
+    (refused.message ?? '').includes("HOST's live-subagent capacity is exhausted")
+      && !(refused.message ?? '').includes('Pipeline stage UNAVAILABLE')
+      && !(refused.message ?? '').includes('STOP and report to the user'),
+    (refused.message ?? '').slice(0, 240),
+  );
+  check(
+    'A8 文案给出复用/等待出路（pipeline_followup + LATER step）',
+    (refused.message ?? '').includes('pipeline_followup') && (refused.message ?? '').includes('LATER step'),
+    (refused.message ?? '').slice(0, 400),
+  );
+
+  // 对照组：与容量无关的创建失败仍然是阶段不可用（不能被这次改动误伤）。
+  hostCap.calls.startFailure = new Error('unrelated subagent store explosion');
+  const broken = await attempt(hostCap, 'subagent_impl', { description: 'other failure' });
+  check(
+    'A8 非容量错误仍按阶段不可用处理（保留 UNAVAILABLE 指引）',
+    (broken.message ?? '').includes('Pipeline stage UNAVAILABLE') && (broken.message ?? '').includes('STOP and report to the user'),
+    (broken.message ?? '').slice(0, 200),
+  );
+  hostCap.calls.startFailure = null;
+}
+
+// A9 冷启动复用撞上宿主容量：queue 投递路径的 RemoteError('subagent/delivery-unavailable')
+{
+  const cold = await newHarness('parent-host-cap-followup', capStages(0));
+  const dispatched = await attempt(cold, 'subagent_impl', { description: 'cold child' });
+  const childId = dispatched.result?.subagentId;
+  // 冷下来：settle 后宿主行改 idle，唤醒它就需要一个新的存活名额。
+  cold.emit('subagent/end', { id: childId });
+  cold.children.set(childId, { activity: 'idle', label: 'impl/cold child' });
+  const deliveryError = new Error('subagent follow-up is temporarily unavailable');
+  deliveryError.code = 'subagent/delivery-unavailable';
+  cold.calls.promptFailure = deliveryError;
+  cold.settings.followupMode = 'queue';
+  const refused = await attemptFollowup(cold, childId, 'more work');
+  check('A9 冷启动被容量拒绝：pipeline_followup 抛错且什么都没投递', refused.ok === false && cold.queued.length === 0, JSON.stringify(refused).slice(0, 200));
+  check(
+    'A9 文案说清「孩子完好、什么都没投递、等名额释放后重试」，且不带 UNAVAILABLE 指引',
+    (refused.message ?? '').includes("HOST's live-subagent capacity is exhausted")
+      && (refused.message ?? '').includes('NOTHING was delivered')
+      && !(refused.message ?? '').includes('Pipeline stage UNAVAILABLE'),
+    (refused.message ?? '').slice(0, 260),
+  );
+
+  // 对照组：非容量类投递失败仍是原来的 delivery failed 文案。
+  const otherError = new Error('subagent not-resumable');
+  otherError.code = 'subagent/not-resumable';
+  cold.calls.promptFailure = otherError;
+  const other = await attemptFollowup(cold, childId, 'more work');
+  check('A9 非容量投递失败仍报 pipeline_followup delivery failed', (other.message ?? '').includes('pipeline_followup delivery failed'), (other.message ?? '').slice(0, 160));
+  cold.calls.promptFailure = null;
 }
 
 // A5 并发竞态：同一个程序里 Promise.all 三个（cap=1）→ 同步预留只放行 1 个
