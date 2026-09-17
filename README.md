@@ -499,6 +499,15 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.2.5（预设简介收窄到 20 字以内）**：
+  - **问题**：`preset/code-pipeline/preset.yml` 的 `description` 有 600+ 字——模式、三个工具、组合方式、Workstreams、墙钟、复用、容量上限全塞进同一句，Agent preset 选择器里糊成一大段，扫一眼读不完。
+  - **做法**：压到 **18 字** —— `规划→实现→评审的三阶段子代理流水线`。细节本来就在 README（安装、并发上限、墙钟预算、`pipeline_followup`、压缩触发比例）与 Settings → 代码流水线 里；选择器只需要回答「这是什么」。
+  - 只动 `preset/code-pipeline/preset.yml`。**已安装的预设不会被插件覆盖**（自动安装只在目标缺失时发生），要生效需手动同步，见「预设文件（preset/）」。
+- **0.2.4（宿主「同时存活子代理」容量拒绝改判为瞬时策略拒绝）**：
+  - **问题**：dsh 0.1.6-alpha.2 新增 `subagent.maxActiveSubagents`（每个 root 默认 **8** 个同时存活的 continuable 子代理，提交 `16620a3a70` / `a69cfb3636`，alpha.1 无此上限）。名额用尽时 `startContinuable` 抛 `ACTIVATION_LIMIT_REACHED`，冷启动一个已 settle 的子代理走 prompt 通道被映射成 `subagent/delivery-unavailable`。插件此前把两者一律包成 `stageUnavailable()` 并附 `UNAVAILABLE_GUIDANCE`（"STOP and report to the user … do NOT retry"），于是第 9 个同时在跑的子代理会让主代理**终止整个任务**——而实际只需等一个子代理结束、或复用已有子代理。
+  - **做法**：新增 `isHostCapacityRejection()` 沿 `cause` 链识别上述两种错误码与宿主文案；阶段派发与 `pipeline_followup` 冷启动分流到 `stageHostCapacityReached()` / `followupHostCapacityReached()`，文案明确 "NOT stage unavailability" 并给出「复用 / 等名额释放后重试 / 主会话自己做」三条出路。非容量类错误仍走原 `stageUnavailable` / `delivery failed` 路径。
+  - `maxConcurrency` 设置项描述与 `pipeline_followup` 工具描述不再宣称「0 = 不限制」与「复用永远可用」；`/dsh-code-pipeline/status` 新增 `hostActiveSubagentLimit` 字段（读不到时不返回）；README 新增「宿主还有一层同时存活容量上限」小节，并把四类策略拒绝列入「不算阶段不可用」例外清单。
+  - **测试**：新增 **A8**（派发容量拒绝 + 非容量对照）与 **A9**（冷启动容量拒绝 + 非容量对照）共 7 项。断言数 **167 → 174**、0 failure。
 - **0.2.3（补一条协议规则 + 一条断言：评审第 2 轮起「只送增量」必须先有「每轮快照」才可执行）**：
   - **问题（本插件自己的 0.2.2 评审循环暴露的）**：0.2.2 已把「评审后续轮只送自上次裁决以来发生变化的 hunk」写进协议，但那条规定**不可执行**——没有任何东西保留上一轮的文件状态，能拿到的只有 `git diff HEAD` 的累积 patch，于是三轮评审都只能收到累积 patch，体量单调增长 **41,845 → 48,795 → 56,527 个字符**，同一批 hunk 被重复送进同一个评审子代理的上下文。
   - **做法**：在预设的「Repeat review rounds reuse the SAME reviewer」小节里、导语与编号列表之间新增一段**快照协议**：每轮 impl settle 之后，把所有改动过的路径按轮次拷进平台临时根下的目录 —— `$TMPDIR/dsh-pipeline-snap/<task>/round<N>/<原始相对路径>` —— 下一轮的增量用 `diff -ruN <round1>/ <round2>/`（或 `git diff --no-index`）生成，并限定在该任务的路径范围内；**快照绝不写进工作区**。同一条规则也追加进 Build flow 第 4 步（Review）末尾：评审前捕获变更集时顺手快照，下一轮才能送增量而不是累积 patch。
