@@ -213,6 +213,8 @@
             | not-actionable | deferred-by-policy
       ```
 
+      **Apply the policy in code, not by eyeballing.** Stage subagents now return STRUCTURED envelopes: a review child submits a review envelope (validated at the call — its graded findings), and `pipeline_result({ child: "<reviewerId>" })` hands it back as a data object inside your program, so the whitelist above is a `.filter()` over `issues` rather than a judgement call. Check `parsed` first: when it is false the child produced no envelope and you must fall back to reading its settled notice. Then deliver the survivors as `pipeline_followup({ child: "<implId>", issues: toFix })` — the plugin renders them into the message, so you never retype an issue list into prose.
+
       - **Never lower or raise a severity yourself** — the reviewer owns the grading; you only apply the whitelist above.
       - **Deferred findings are still reported.** List them in the final message with their severity and a one-line reason, so the user can disagree. Silently dropping a finding is forbidden — and so is smuggling a deferred finding into the implementer's followup because it looked easy.
       - **Objective signal wins.** Run the tests / type-check / linter when they exist, and never let a review finding override a green objective signal. Equally: never skip the objective check just because the review looked clean.

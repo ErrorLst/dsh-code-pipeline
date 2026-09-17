@@ -500,6 +500,16 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.1（结构化 I/O：pipeline_submit + pipeline_result + 结构化投递 + 轮次遥测）**：
+  - **问题**：阶段子代理的结论全是自由文本——review 的 verdict 与 issue 列表、plan 的 Workstreams 表、impl 的变更摘要，都要主代理「读文本再抄一遍」。0.3.0 的裁决白名单因此只能靠模型逐条判断，而 reviewer 的硬约束（没有触发场景不得 blocking、docs/style 不得 blocking）也还只是 persona 里的劝告。
+  - **回执结构化**：三个阶段各有 envelope（`plan` / `impl` / `review`，见 `ENVELOPE_SCHEMAS`），随每次派发在 `requiredOutput` 里下发（子代理不必猜形状）。两条通道写进同一台账：① 插件给**阶段子代理**注入窄工具 `pipeline_submit`（靠 `agent.options.stageKey` 识别，不靠台账——`dispatched` 要等 `startContinuable` 返回后才写入），在**调用点**做 schema + 语义校验，不合格当场打回、子代理当轮即可修正；② 兜底：`subagent/end` 从最终回复的最后一个 `json` 围栏解析。解析失败**不阻塞**，`pipeline_result` 如实返回 `{parsed:false, reason}`。
+  - **reviewer 硬约束变成机制**：`validateEnvelope` 在提交点拒绝「blocking 却没有 failureScenario」「docs/style 标 blocking」「不在改动行上标 blocking」「verdict 与 findings 不一致」的 envelope——0.3.0 只让 reviewer 承诺，这一版让它做不到。
+  - **`pipeline_result({child})`**：主代理在程序里把回执当数据用（`issues[]` 带 severity / blocking / confidence / onChangedLines），裁决白名单因此是 `.filter()` 而不是「读文本判断」。
+  - **结构化投递**：`pipeline_followup` 新增可选 `issues[]` / `changeSet`，插件负责渲染成子代理可读文本；`message` 从必填改为「与 `issues` 至少其一」。主代理不再手抄 issue 列表，也就不会在抄写时丢字段或加戏。
+  - **轮次与 blocking 遥测**：按父会话记录每轮 review 的 verdict 与 blocking 数，`/dsh-code-pipeline/status` 新增 `reviews: {rounds, blockingTrend, lastVerdict}`——「第几轮了、blocking 有没有在下降」正是收敛判据要看的量。`subagent/start` 会作废上一轮回执，避免复用被唤醒时 `pipeline_result` 返回陈旧 verdict。
+  - **协议同步**：triage 小节改为「在代码里套白名单」（`pipeline_result` + `pipeline_followup({issues})`）；plan / impl persona 与阶段工具 description 补上各自的 envelope。
+  - **测试**：新增 H 块 18 条断言（提交工具注入与 schema、五条语义拒绝路径、兜底解析与解析失败、`subagent/start` 作废、issues 渲染与并存）。断言数 **178 → 196**、0 failure；在真实 DSH 组合里启动 0 错误，status 已返回 `reviews`。
+  - 本版为**阶段 2**（结构化 I/O）；阶段 3（档位闸门 `pipeline_tier` 与设置页）未做。
 - **0.3.0（协议分档重写 T0/T1/T2 + 评审分级裁决 + 循环收敛；只改协议文本，无插件逻辑改动）**：
   - **问题**：① 分档表虽然存在（Trivial/Small/Documentation-only/Standard/Large），但被三条更强的 ALL-CAPS 不变式压过——`every planned change (even a trivial one) goes through the impl stage`、`Never fix review issues yourself`，加上 Small 的「用户观察不到行为变化」定义极窄，导致两文件的行为修复也走完整 plan→gate→impl→review；而且**没有 T1 档**（主会话自己规划 + impl→review），中间形态掉进缝里。② reviewer 只被要求「文件 + 问题 + 建议修法」，`Never approve with unresolved material defects` 里的 material 无法执行；编排协议又禁止主会话做任何判断，review 的 issue 原样全量交给 impl——于是只要 reviewer 每轮再提一条就必然跑满 3 轮、永远看不到 APPROVED；而「最多 3 轮」本身也没有任何机制执行（插件不记轮次）。
   - **分档改为 T0/T1/T2**：T0（≲60 行 / ≤2 文件 / 文档注释 / 机械操作 / 单点无设计决策）主会话直接做、不起子代理；T1（3–8 文件，或 ~60–500 行，单子系统且设计已由需求定死）由主会话自己写计划放进 `plan` 字段，只派 impl→review；T2 才走完整流程。新增**惰性升级**（从 T0 开始，命中触发条件才升级；升级单向且必须 `todo_write` 留痕）与**允许降级**；并明确「T0 不等于跳过验证」（改完自己跑测试/构建）。三条压制分档的不变式同步改写。
