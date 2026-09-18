@@ -61,7 +61,7 @@ function createHarness(parentId = 'parent-1') {
   // 宿主调用记账：实参形状与调用次数（宿主契约回归——漏传 signal 会让脚本变红）。
   // promptPayloads 在"判定接受之前"记录每次尝试的载荷：探测表的尝试序列因此可断言
   // （光看 queued[last] 看不出中间试过哪些形状）。
-  const calls = { prompt: 0, promptPayloads: [], promptSignals: [], startSignals: [], startPrompts: [], sendMessageOptions: [], rejectDelivery: false, rejectKnownShapes: false, rewriteBadPayloadMessage: false,
+  const calls = { prompt: 0, promptPayloads: [], promptSignals: [], startSignals: [], startPrompts: [], startPersonas: [], sendMessageOptions: [], rejectDelivery: false, rejectKnownShapes: false, rewriteBadPayloadMessage: false,
     // 创建上限 / 压缩顺序断言的记账：
     //   start          —— 宿主创建入口 startContinuable 的真实调用次数（证明闸门是代码拦的）；
     //   order          —— 跨服务统一调用序列（压缩必须早于投递）；
@@ -128,6 +128,7 @@ function createHarness(parentId = 'parent-1') {
       }
       calls.startSignals.push(spec.signal);
       calls.startPrompts.push(spec.request.prompt[0].text);
+      calls.startPersonas.push(spec.request?.persona);
       calls.start += 1;
       calls.order.push('startContinuable');
       // 容量拒绝发生在 reserve 阶段（宿主 continuation-activation.ts:41-55），
@@ -286,7 +287,7 @@ const statusOf = async () => {
 };
 const allStages = (minutes) => ({ plan: { budgetMinutes: minutes }, impl: { budgetMinutes: minutes }, review: { budgetMinutes: minutes } });
 const followup = (child, message) => h.tools.get('pipeline_followup').execute(
-  { child, message },
+  { child, message, files: '-' },
   { agent: h.parent, signal: new AbortController().signal },
 );
 // 探测表载荷的简写形状（断言失败时把"到底试了哪些形状"打出来）。
@@ -411,7 +412,7 @@ const shapeOf = (row) => row === undefined
 {
   h.settings.stages = allStages(10);
   const followup = h.tools.get('pipeline_followup');
-  const run = (child, message) => followup.execute({ child, message }, { agent: h.parent, signal: new AbortController().signal });
+  const run = (child, message) => followup.execute({ child, message, files: '-' }, { agent: h.parent, signal: new AbortController().signal });
 
   // 8a) 运行中插话：不重置（否则 steer 就是绕过止损线的手段）
   const beforeRunning = h.interrupts.length;
@@ -471,7 +472,7 @@ const shapeOf = (row) => row === undefined
   check('queue 载荷是宿主唯一合法形状（mode=continuable + delivery=queue）',
     payload?.mode === 'continuable' && payload?.delivery === 'queue'
       && payload?.childSessionId === child.subagentId
-      && payload?.content?.[0]?.text === 'queued requirement change',
+      && payload?.content?.[0]?.text.startsWith('queued requirement change'),
     JSON.stringify(payload ?? null));
   check('queue 投递只发生一次尝试（探测表首项即被接受，无第 2 次尝试）',
     h.calls.prompt === beforeAttempts + 1, 'attempts ' + (h.calls.prompt - beforeAttempts));
@@ -579,7 +580,7 @@ const runStage = (harness, toolName, args = {}) => harness.tools.get(toolName).e
   { agent: harness.parent, signal: new AbortController().signal },
 );
 const runFollowup = (harness, child, message, compact) => harness.tools.get('pipeline_followup').execute(
-  compact === true ? { child, message, compact: true } : { child, message },
+  compact === true ? { child, message, files: '-', compact: true } : { child, message, files: '-' },
   { agent: harness.parent, signal: new AbortController().signal },
 );
 const attempt = async (harness, toolName, args = {}) => {
@@ -656,6 +657,7 @@ const attemptFollowup = async (harness, child, message, compact) => {
   check('A2 创建上限文案带第 1 个子代理的 id', creationMessage.includes(firstId), firstId);
   check('A2 创建上限文案带它的 label（含阶段前缀）', creationMessage.includes(firstLabel), firstLabel);
   check('A2 创建上限文案给出 pipeline_followup 复用出路', creationMessage.includes('pipeline_followup'));
+  check('A2b 创建上限文案写明跨工作流复用的代价与优先级', creationMessage.includes('CROSS-WORKSTREAM REUSE HAS A PRICE') && creationMessage.includes('~150k re-sent tokens per step') && creationMessage.includes('a `files` list'), creationMessage.slice(0, 260));
   check(
     'A2 创建上限文案不再把 compact: true 当出路，而是「压缩不掉 → 接受干扰 / 有名额才新派」',
     creationMessage.includes('you cannot compact it away')
@@ -1464,7 +1466,7 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   check(
     'P1 消息真的投递到了那个持久面子代理（投递实参 = 该 id）',
     p1.steers.length === 1 && p1.steers[0].childId === 'persisted-impl-1'
-      && p1.steers[0].text === 'continue the pre-restart work',
+      && p1.steers[0].text.startsWith('continue the pre-restart work'),
     JSON.stringify(p1.steers),
   );
   check(
@@ -1883,13 +1885,17 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   const dFollow = await attempt(iso4, 'subagent_impl', { description: 'structured followup' });
   const delivered = await attemptTool(
     iso4.tools.get('pipeline_followup'),
-    { child: dFollow.result?.subagentId, issues: [{ id: 'R9', severity: 'high', blocking: true, category: 'correctness', problem: 'boom', failureScenario: 'empty input', suggestedFix: 'guard the empty case' }] },
+    { child: dFollow.result?.subagentId, files: 'packages/plugin-api/src/engine.ts', issues: [{ id: 'R9', severity: 'high', blocking: true, category: 'correctness', problem: 'boom', failureScenario: 'empty input', suggestedFix: 'guard the empty case' }] },
     iso4.parent,
   );
   const steered = iso4.steers[iso4.steers.length - 1]?.text ?? '';
   check('H8 pipeline_followup 接受 issues[]（无需 message）并渲染进投递文本', delivered.ok === true && steered.includes('TRIAGED ISSUES') && steered.includes('[R9]') && steered.includes('boom'), steered.slice(0, 220));
   check('H8 渲染带 failureScenario / suggestedFix，主代理无需手抄', steered.includes('failure scenario: empty input') && steered.includes('suggested fix: guard the empty case'), steered.slice(0, 260));
-  const both = await attemptTool(iso4.tools.get('pipeline_followup'), { child: dFollow.result?.subagentId, message: 'Round 2: fix only these.', issues: [{ id: 'R10', severity: 'high', blocking: true, category: 'correctness', problem: 'x', failureScenario: 'y', onChangedLines: true }] }, iso4.parent);
+  check('H9 followup 的 files 渲染成与阶段派发同一段「一个程序先读完」硬指令', steered.includes('ONE run_code program') && steered.includes('packages/plugin-api/src/engine.ts'), steered.slice(0, 260));
+  check('H9 impl 子代理的 persona 带批量纪律（BATCH THE LOOP）', String(iso4.calls.startPersonas.at(-1) ?? '').includes('BATCH THE LOOP'), String(iso4.calls.startPersonas.at(-1) ?? '').slice(0, 120));
+  const noFiles = await attemptTool(iso4.tools.get('pipeline_followup'), { child: dFollow.result?.subagentId, message: 'no files here' }, iso4.parent);
+  check('H9 缺 files 的 followup 被拒且错误点名 files', noFiles.ok === false && String(noFiles.message).includes('"files" is required'), String(noFiles.message).slice(0, 200));
+  const both = await attemptTool(iso4.tools.get('pipeline_followup'), { child: dFollow.result?.subagentId, message: 'Round 2: fix only these.', files: '-', issues: [{ id: 'R10', severity: 'high', blocking: true, category: 'correctness', problem: 'x', failureScenario: 'y', onChangedLines: true }] }, iso4.parent);
   check('H8 message 与 issues 可并存（message 作为指令正文在前）', both.ok === true && String(iso4.steers[iso4.steers.length - 1]?.text ?? '').startsWith('Round 2: fix only these.'), String(iso4.steers[iso4.steers.length - 1]?.text ?? '').slice(0, 160));
 }
 

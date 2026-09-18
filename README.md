@@ -50,6 +50,12 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   `plan` / `impl` / `review`（含中文别名 规划/计划/实现/评审/审查）| 完整
   `subagentId`（`session-...`，也支持唯一前缀）；
 - 参数 `message`：要插入的需求变更文本（完整、自包含——子代理没有本对话上下文）；
+- 参数 `files`（**必填**）：本轮要读的路径，一行一个，与三个阶段工具的 `files` 共用同一套契约
+  与渲染。真清单会渲染成「先用**一个** `run_code` 程序把每个路径读完」的硬指令；单个 `-`
+  显式声明「本轮没有候选清单」（子代理自己做侦察）。**省略 ⇒ 拒绝并点名 `files`**。为什么必填：
+  复用路径曾经只发一段自由文本，一个被复用去干**另一个 workstream** 的实现子代理于是花了
+  **7 步 / 15 次 read** 去重新发现一份主代理手里已有的清单——`files` 在派发路径上修过一次
+  （0.3.5/0.3.6），这是把它补回**复用**这条路径；
 - 参数 `compact`（可选，默认 `false`）：**在投递之前**压缩**该子代理自己**的历史
   （走该预设 realm 私有的 `compaction` 服务——`agentPresets.serviceFor(agent, "compaction")`，
   超时 10 分钟）。只应在「复用会把干扰带进来」时用（四条可判定判据见预设的
@@ -437,7 +443,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 209 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 213 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -500,6 +506,13 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.8（复用路径丢掉了 `files` 契约；创建上限把「跨工作流复用」变成最贵的一轮；impl 批量纪律）**：
+  - **实测证据**（`zy_platform_frontend`：impl A `a62f32bb`、impl B `ec281c36`、review `d38977c7`、主会话 `session-5556e686`）：主会话第 5 轮想**并行派发 impl B + impl C**，`subagent_impl` 被创建上限拒绝（limit 2，已创建 A/B）→ 按协议复用 A 去干 **Workstream C**（另一个工作流、另一批文件），于是 A 的第 2 轮 **63 步 / 9.7M tokens**（比第一轮 41 步还长），每步重发约 **152k** 累积上下文；review 侧同因：`stage concurrency limit (limit 1)` 与 `stage CREATION limit (limit 1)` 让第二个 reviewer 从未被创建。另外两处形状问题：① 复用路径只发一段自由文本、**没有 `files`**，A 的第 2 轮开头 **7 步 / 15 次 read** 全在重新发现 core-settings 的文件；② impl **41–60% 的步只发一个工具调用**（plan 17% / review 0–20%），DSH 自带的 `repeat-tool-reminder` 在其中触发了 `read × 3` / `read × 5`。
+  - **做法（复用路径接回 `files`）**：`pipeline_followup` 新增**必填** `files`，与三个阶段工具共用 `renderFilesBlock`——真清单渲染成「先用一个 `run_code` 程序读完」，`-` 显式声明没有清单；省略 → 拒绝并点名 `files`。
+  - **做法（把跨工作流代价写进拒绝文案）**：创建/并发上限错误新增 `CROSS-WORKSTREAM REUSE HAS A PRICE` 段——冷 child 无法压缩、每步重发多少、实测 63 步 ≈ 10M 额外 tokens，并给出优先级：(a) 优先 steer 仍在 RUNNING 的 child（不占新名额）→ (b) 永远带 `files` → (c) 计划的工作流数超过上限就「合并成一个 child 串行跑」而不是硬塞 → (d) 接受代价。预设的复用策略同步改写：`compact` 不再被列为一条出路，并新增「跨工作流复用有代价」段落。
+  - **做法（impl persona 的批量纪律）**：impl persona 新增 `BATCH THE LOOP`——探针/查配置/读报错是**一个程序**而不是一步；注释与 JSDoc 微调必须与所属编辑**同一个程序**；需要精确原文时**同程序内先读后改**；输入没变的命令不要重跑。
+  - **验证**：冒烟 H9×3（followup 的 `files` 渲染 / impl persona 带 `BATCH THE LOOP` / 缺 `files` 被拒）、A2b（创建上限文案含跨工作流代价）。断言数 **209 → 213**、0 failure。
+  - 版本 0.3.7 → 0.3.8。**预设改动需要手动同步**（自动安装不覆盖已有预设）。
 - **0.3.7（plan 一开始的成片报错与「提醒洪水」：失败的 read 被记成「读过」+ 一次程序刷 23 条提醒）**：
   - **实测证据**（`zy_platform_frontend`，plan 子代理 `9f55ce95`，13 步 / 129 次嵌套调用）：第 2 步用一个 `run_code` 程序读 25 个文件，**25 次全部失败** `ToolCallError: limit must be less than or equal to 2000`（它按 persona 的「read whole files」传了 `limit: 2500`）；第 3 步用 `limit: 2000` 重读 23 个，而读卫生守卫把这 23 次**重试**判成了「跨步骤重读」，于是一步之内注入 **23 条 `[read-hygiene]` user 消息**（约 9KB；全会话累计 27 条 / 11KB，全部是假警报）。第 10–11 步另有 6 次 `binding arguments must be lossless JSON`：子代理把 `include: undefined` 传给了 `tools.grep`，PTC 绑定的 lossless-JSON 校验在派发前就否决了整个参数对象。
   - **做法（插件侧，两个 bug）**：① `tools/post-execute` 的 `result.isError === true` 时**既不记历史也不提醒**——超限 / 文件不存在 / 被策略拒绝的调用什么都没进上下文，把它们记成「已经读过」必然让下一次重试变成假警报；② 同一个 `run_code` 程序里触发的提醒**攒到程序结束（外层调用）再合成一条**汇总，不再逐个文件挂 user 消息。

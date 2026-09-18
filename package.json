@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-code-pipeline",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "DSH bundle plugin: 为 code-pipeline 预设（PTC 流水线）动态注入阶段子代理工具（subagent_plan / subagent_impl / subagent_review），各阶段 provider/model/思考等级/最大并发数可在设置页（Settings → 代码流水线）实时配置并持久化到 settings.yaml（最大并发是双层语义、按父会话准入：①同时运行的子代理上限 ②该阶段「已创建（含已结束）」子代理的总量上限；到达创建上限后新派发被拒绝并列出可复用的子代理 id，请用 pipeline_followup 复用；运行中可动态调整，0 = 本插件不限制，但仍受宿主每会话同时存活 continuable 子代理上限 subagent.maxActiveSubagents 约束，默认 8）；预设文件随项目在 preset/ 目录维护，首次启动自动安装到 $DSH_HOME/.agent-presets（见 README）；三阶段统一「复用优先」（prompt 协议 + 插件层硬上限：plan/impl/review 同一任务的后续轮次都用 pipeline_followup 续用已有子代理，第 2 轮起增量投递，不新增设置项）；pipeline_followup 支持 compact=true：投递之前先压缩目标子代理自己的历史（有干扰时才用，压缩失败则什么都不投递）；每阶段可配墙钟预算（80% 软警告、到点自动中断该子代理并自动索取收尾报告，按「续 / 拆 / 停」协议处置）＋计划产出 Workstreams 切分表（独立工作流并行 impl、各自路径受限 diff 独立评审）",
   "homepage": "https://github.com/ErrorLst/dsh-code-pipeline",
   "repository": {
