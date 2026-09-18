@@ -1781,16 +1781,26 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
 }
 
 
-// ── H. 结构化 I/O（阶段回执 envelope / pipeline_submit / pipeline_result）────────
-// 阶段子代理把结论作为结构化对象交回来：优先走 pipeline_submit（调用点 schema + 语义
-// 校验，不合格当场打回），否则由插件在 subagent/end 解析最终回复里的 json 围栏。
-// 主代理用 pipeline_result 读回，triage 白名单因此在程序里可跑。
+// ── H. 结构化 I/O（阶段回执 envelope / pipeline_result / 解析后语义校验）────────
+// 阶段子代理把结论作为结构化对象交回来：最终回复里的一个 json 围栏，插件在
+// subagent/end 解析并做**语义校验**，主代理用 pipeline_result 读回。
+// （0.3.1 曾用注入的 pipeline_submit 做"调用点校验"，因宿主 tools.restrict 只认全局
+//  注册的工具名，导致 plan/review 的派发全部抛 unknown global tool 而失败；H3 就是
+//  那次的回归防线：只读白名单里不得再出现插件私有工具名。）
 {
+  const FENCE = String.fromCharCode(96, 96, 96);
+  const pluginSource = readFileSync(join(root, 'lib', 'index.js'), 'utf8');
+  const roStart = pluginSource.indexOf('const READ_ONLY_TOOLS');
+  const roBlock = pluginSource.slice(roStart, pluginSource.indexOf('];', roStart));
+  check(
+    'H3 只读白名单只含宿主全局工具（不得再出现 pipeline_submit 这类插件私有名）',
+    roStart > 0 && !roBlock.includes('pipeline_submit') && !roBlock.includes('subagent_'),
+    roBlock.replace(/\s+/g, ' ').slice(0, 220),
+  );
   check('H1 主代理侧注册了 pipeline_result（阶段工具之外的第 5 个）', typeof h.tools.get('pipeline_result')?.execute === 'function');
 
   const iso = await newHarness('parent-iso-1', capStages(0));
   const dImpl = await attempt(iso, 'subagent_impl', { description: 'iso work' });
-  const implId = dImpl.result?.subagentId;
   const empty = await attemptTool(iso.tools.get('pipeline_result'), { child: 'impl' }, iso.parent);
   check(
     'H2 没有回执时 pipeline_result 如实返回 parsed:false + reason（不编造）',
@@ -1798,79 +1808,90 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
     JSON.stringify(empty).slice(0, 180),
   );
 
-  const child = iso.addStageChild(implId, 'impl');
-  iso.emit('agent/created', { agent: child.agent });
-  const submit = child.tools.get('pipeline_submit');
-  check('H3 阶段子代理被注入 pipeline_submit（识别依据 = agent.options.stageKey）', typeof submit?.execute === 'function');
+  const emitEnd = (harness, childId, obj) => harness.emit('subagent/end', {
+    id: childId,
+    lastAssistantMessage: [{ type: 'text', text: ['work done', '', FENCE + 'json', JSON.stringify(obj), FENCE].join('\n') }],
+  });
+  const readImpl = (harness) => attemptTool(harness.tools.get('pipeline_result'), { child: 'impl' }, harness.parent);
+
+  emitEnd(iso, dImpl.result?.subagentId, { kind: 'impl', summary: 'via fence', files: [{ path: 'a.ts', change: 'edited' }] });
+  const okRead = await readImpl(iso);
   check(
-    'H3 impl envelope 的 schema 强制 kind + summary',
-    Array.isArray(submit?.parameters?.properties?.envelope?.required)
-      && submit.parameters.properties.envelope.required.includes('kind')
-      && submit.parameters.properties.envelope.required.includes('summary'),
-    JSON.stringify(submit?.parameters?.properties?.envelope?.required),
-  );
-  const okEnvelope = await attemptTool(submit, { envelope: { kind: 'impl', summary: 'did the thing', files: [{ path: 'a.ts', change: 'edited' }] } }, child.agent);
-  check('H4 pipeline_submit 接受合法 envelope 并回执 ok', okEnvelope.ok === true && okEnvelope.result?.ok === true && okEnvelope.result?.kind === 'impl', JSON.stringify(okEnvelope).slice(0, 180));
-  const read = await attemptTool(iso.tools.get('pipeline_result'), { child: 'impl' }, iso.parent);
-  check(
-    'H4 pipeline_result 读回结构化回执（source=submit，value 完整）',
-    read.ok === true && read.result?.parsed === true && read.result?.source === 'submit' && read.result?.value?.summary === 'did the thing',
-    JSON.stringify(read).slice(0, 220),
+    'H4 合法 envelope：parsed=true / source=parsed / value 完整 / 无 validationProblems',
+    okRead.result?.parsed === true && okRead.result?.source === 'parsed' && okRead.result?.value?.summary === 'via fence'
+      && okRead.result?.validationProblems === undefined,
+    JSON.stringify(okRead).slice(0, 220),
   );
 
-  // reviewer 的硬约束在调用点变成机制：写不出触发场景 / docs-style / 不在改动行上 /
-  // verdict 与 findings 不一致的 envelope 直接被拒，子代理当轮就能改。
+  // review 的三条硬约束在解析后仍然执行（reviewer persona 的承诺 -> 插件校验）。
   const dReview = await attempt(iso, 'subagent_review', { description: 'iso review', diff: '@@ -1 +1 @@\\n-a\\n+b' });
-  const reviewChild = iso.addStageChild(dReview.result?.subagentId, 'review');
-  iso.emit('agent/created', { agent: reviewChild.agent });
-  const rsubmit = reviewChild.tools.get('pipeline_submit');
-  check('H5 review 子代理也拿到 pipeline_submit（只读白名单放行了它）', typeof rsubmit?.execute === 'function');
+  const reviewId = dReview.result?.subagentId;
+  const readReview = () => attemptTool(iso.tools.get('pipeline_result'), { child: 'review' }, iso.parent);
+  const problemsOf = (result) => Array.isArray(result?.validationProblems) ? result.validationProblems.join(' ') : '';
 
-  const noScenario = await attemptTool(rsubmit, { envelope: { kind: 'review', verdict: 'request_changes', issues: [{ id: 'R1', severity: 'high', blocking: true, category: 'correctness', problem: 'x' }] } }, reviewChild.agent);
-  check('H5 blocking 但写不出 failureScenario → 调用点拒绝', noScenario.ok === false && String(noScenario.message).includes('failureScenario'), String(noScenario.message).slice(0, 200));
-  const docsBlocking = await attemptTool(rsubmit, { envelope: { kind: 'review', verdict: 'request_changes', issues: [{ id: 'R2', severity: 'high', blocking: true, category: 'docs', problem: 'doc gap', failureScenario: 'x', onChangedLines: true }] } }, reviewChild.agent);
-  check('H5 docs 类问题不得 blocking → 调用点拒绝', docsBlocking.ok === false && String(docsBlocking.message).includes('docs/style'), String(docsBlocking.message).slice(0, 200));
-  const offDiff = await attemptTool(rsubmit, { envelope: { kind: 'review', verdict: 'request_changes', issues: [{ id: 'R3', severity: 'critical', blocking: true, category: 'correctness', problem: 'x', failureScenario: 'y', onChangedLines: false }] } }, reviewChild.agent);
-  check('H5 不在改动行上的问题不得 blocking → 调用点拒绝', offDiff.ok === false && String(offDiff.message).includes('off the changed lines'), String(offDiff.message).slice(0, 200));
-  const badVerdict = await attemptTool(rsubmit, { envelope: { kind: 'review', verdict: 'approve', issues: [{ id: 'R4', severity: 'critical', blocking: true, category: 'correctness', problem: 'x', failureScenario: 'y', onChangedLines: true }] } }, reviewChild.agent);
-  check('H5 有 blocking 却报 approve → verdict 与 findings 不一致，调用点拒绝', badVerdict.ok === false && String(badVerdict.message).includes('request_changes'), String(badVerdict.message).slice(0, 200));
-  const goodReview = await attemptTool(rsubmit, { envelope: { kind: 'review', verdict: 'request_changes', blockingCount: 1, issues: [{ id: 'R5', severity: 'high', blocking: true, category: 'correctness', problem: 'null deref', failureScenario: 'empty list reaches the branch', onChangedLines: true }, { id: 'R6', severity: 'low', blocking: false, category: 'docs', problem: 'typo' }] } }, reviewChild.agent);
-  check('H5 合法 review envelope（1 blocking + 1 non-blocking）被接受', goodReview.ok === true && goodReview.result?.ok === true, String(goodReview.message).slice(0, 180));
+  emitEnd(iso, reviewId, { kind: 'review', verdict: 'request_changes', issues: [{ id: 'R1', severity: 'high', blocking: true, category: 'correctness', problem: 'x' }] });
+  let rr = await readReview();
+  check('H5 blocking 却没有 failureScenario → 记入 validationProblems（不阻塞，交编排者）', rr.result?.parsed === true && problemsOf(rr.result).includes('failureScenario'), JSON.stringify(rr.result?.validationProblems));
 
-  // 兜底通道：没有 pipeline_submit 的子代理（旧 descriptor / 工具不可用）从最终回复解析。
-  const FENCE = String.fromCharCode(96, 96, 96);
+  iso.emit('subagent/start', { id: reviewId });
+  emitEnd(iso, reviewId, { kind: 'review', verdict: 'request_changes', issues: [{ id: 'R2', severity: 'high', blocking: true, category: 'docs', problem: 'doc gap', failureScenario: 'x', onChangedLines: true }] });
+  rr = await readReview();
+  check('H5 docs 类问题标 blocking → 记入 validationProblems', problemsOf(rr.result).includes('docs/style'), JSON.stringify(rr.result?.validationProblems));
+
+  iso.emit('subagent/start', { id: reviewId });
+  emitEnd(iso, reviewId, { kind: 'review', verdict: 'approve', issues: [{ id: 'R3', severity: 'critical', blocking: true, category: 'correctness', problem: 'x', failureScenario: 'y', onChangedLines: true }] });
+  rr = await readReview();
+  check('H5 有 blocking 却报 approve → 记入 verdict 不一致', problemsOf(rr.result).includes('request_changes'), JSON.stringify(rr.result?.validationProblems));
+
+  iso.emit('subagent/start', { id: reviewId });
+  emitEnd(iso, reviewId, { kind: 'review', verdict: 'request_changes', blockingCount: 1, issues: [{ id: 'R4', severity: 'high', blocking: true, category: 'correctness', problem: 'null deref', failureScenario: 'empty list', onChangedLines: true }, { id: 'R5', severity: 'low', blocking: false, category: 'docs', problem: 'typo' }] });
+  rr = await readReview();
+  check('H5 合法 review envelope：解析成功且无 validationProblems', rr.result?.parsed === true && rr.result?.validationProblems === undefined && rr.result?.value?.verdict === 'request_changes', JSON.stringify(rr).slice(0, 200));
+
+  // 无关的 json（没有 kind）不得被误当成"提交了非法回执"。
   const iso2 = await newHarness('parent-iso-2', capStages(0));
-  const dFallback = await attempt(iso2, 'subagent_impl', { description: 'fallback work' });
-  const fenced = ['did it', '', FENCE + 'json', JSON.stringify({ kind: 'impl', summary: 'via fence' }), FENCE].join('\n');
-  iso2.emit('subagent/end', { id: dFallback.result?.subagentId, lastAssistantMessage: [{ type: 'text', text: fenced }] });
-  const parsedRead = await attemptTool(iso2.tools.get('pipeline_result'), { child: 'impl' }, iso2.parent);
-  check(
-    'H6 兜底：从最终回复的 json 围栏解析成结构化回执（source=parsed）',
-    parsedRead.result?.parsed === true && parsedRead.result?.source === 'parsed' && parsedRead.result?.value?.summary === 'via fence',
-    JSON.stringify(parsedRead).slice(0, 220),
-  );
   const dProse = await attempt(iso2, 'subagent_impl', { description: 'prose only' });
+  iso2.emit('subagent/end', { id: dProse.result?.subagentId, lastAssistantMessage: [{ type: 'text', text: 'see the sample\n' + FENCE + 'json\n{"foo":1}\n' + FENCE }] });
+  const notEnv = await attemptTool(iso2.tools.get('pipeline_result'), { child: 'impl' }, iso2.parent);
+  check('H6 有 json 但不是 envelope（无 kind）→ parsed:false，不误判为非法回执', notEnv.result?.parsed === false && String(notEnv.result?.reason).includes('no stage envelope'), JSON.stringify(notEnv.result).slice(0, 200));
+  iso2.emit('subagent/start', { id: dProse.result?.subagentId });
   iso2.emit('subagent/end', { id: dProse.result?.subagentId, lastAssistantMessage: [{ type: 'text', text: 'just prose, no fence' }] });
-  const proseRead = await attemptTool(iso2.tools.get('pipeline_result'), { child: 'impl' }, iso2.parent);
-  check('H6 没有围栏时 parsed:false + reason（解析失败不阻塞、不编造）', proseRead.result?.parsed === false && typeof proseRead.result?.reason === 'string', JSON.stringify(proseRead).slice(0, 180));
-  iso2.emit('subagent/start', { id: dFallback.result?.subagentId });
-  const clearedRead = await attemptTool(iso2.tools.get('pipeline_result'), { child: 'impl' }, iso2.parent);
-  check('H6 新一轮激活（subagent/start）作废上一轮回执，避免被唤醒时读到陈旧 verdict', clearedRead.result?.parsed === false, JSON.stringify(clearedRead).slice(0, 180));
+  const noFence = await attemptTool(iso2.tools.get('pipeline_result'), { child: 'impl' }, iso2.parent);
+  check('H6 没有围栏时 parsed:false + reason（解析失败不阻塞、不编造）', noFence.result?.parsed === false && typeof noFence.result?.reason === 'string', JSON.stringify(noFence.result).slice(0, 160));
+
+  // 新一轮激活作废上一轮回执：复用被唤醒的评审子代理必须给出新 verdict。
+  const iso3 = await newHarness('parent-iso-3', capStages(0));
+  const d3 = await attempt(iso3, 'subagent_impl', { description: 'rounds' });
+  const id3 = d3.result?.subagentId;
+  const endWith = (summary) => iso3.emit('subagent/end', { id: id3, lastAssistantMessage: [{ type: 'text', text: FENCE + 'json\n' + JSON.stringify({ kind: 'impl', summary }) + '\n' + FENCE }] });
+  const read3 = () => attemptTool(iso3.tools.get('pipeline_result'), { child: 'impl' }, iso3.parent);
+  endWith('round 1');
+  const round1 = await read3();
+  iso3.emit('subagent/start', { id: id3 });
+  const cleared = await read3();
+  endWith('round 2');
+  const round2 = await read3();
+  check(
+    'H7 新一轮激活作废上一轮回执，且能读到新回执（不返回陈旧 verdict）',
+    round1.result?.value?.summary === 'round 1' && cleared.result?.parsed === false && round2.result?.value?.summary === 'round 2',
+    JSON.stringify({ r1: round1.result?.value?.summary, cleared: cleared.result?.parsed, r2: round2.result?.value?.summary }),
+  );
 
   // 结构化投递：主代理把 triage 后的 issue 数组原样交给 impl，不必手抄。
-  const iso3 = await newHarness('parent-iso-3', capStages(0));
-  const dFollow = await attempt(iso3, 'subagent_impl', { description: 'structured followup' });
+  const iso4 = await newHarness('parent-iso-4', capStages(0));
+  const dFollow = await attempt(iso4, 'subagent_impl', { description: 'structured followup' });
   const delivered = await attemptTool(
-    iso3.tools.get('pipeline_followup'),
+    iso4.tools.get('pipeline_followup'),
     { child: dFollow.result?.subagentId, issues: [{ id: 'R9', severity: 'high', blocking: true, category: 'correctness', problem: 'boom', failureScenario: 'empty input', suggestedFix: 'guard the empty case' }] },
-    iso3.parent,
+    iso4.parent,
   );
-  const steered = iso3.steers[iso3.steers.length - 1]?.text ?? '';
-  check('H7 pipeline_followup 接受 issues[]（无需 message）并渲染进投递文本', delivered.ok === true && steered.includes('TRIAGED ISSUES') && steered.includes('[R9]') && steered.includes('boom'), steered.slice(0, 220));
-  check('H7 渲染带 failureScenario / suggestedFix，主代理无需手抄', steered.includes('failure scenario: empty input') && steered.includes('suggested fix: guard the empty case'), steered.slice(0, 260));
-  const both = await attemptTool(iso3.tools.get('pipeline_followup'), { child: dFollow.result?.subagentId, message: 'Round 2: fix only these.', issues: [{ id: 'R10', severity: 'high', blocking: true, category: 'correctness', problem: 'x', failureScenario: 'y', onChangedLines: true }] }, iso3.parent);
-  check('H7 message 与 issues 可并存（message 作为指令正文在前）', both.ok === true && String(iso3.steers[iso3.steers.length - 1]?.text ?? '').startsWith('Round 2: fix only these.'), String(iso3.steers[iso3.steers.length - 1]?.text ?? '').slice(0, 160));
+  const steered = iso4.steers[iso4.steers.length - 1]?.text ?? '';
+  check('H8 pipeline_followup 接受 issues[]（无需 message）并渲染进投递文本', delivered.ok === true && steered.includes('TRIAGED ISSUES') && steered.includes('[R9]') && steered.includes('boom'), steered.slice(0, 220));
+  check('H8 渲染带 failureScenario / suggestedFix，主代理无需手抄', steered.includes('failure scenario: empty input') && steered.includes('suggested fix: guard the empty case'), steered.slice(0, 260));
+  const both = await attemptTool(iso4.tools.get('pipeline_followup'), { child: dFollow.result?.subagentId, message: 'Round 2: fix only these.', issues: [{ id: 'R10', severity: 'high', blocking: true, category: 'correctness', problem: 'x', failureScenario: 'y', onChangedLines: true }] }, iso4.parent);
+  check('H8 message 与 issues 可并存（message 作为指令正文在前）', both.ok === true && String(iso4.steers[iso4.steers.length - 1]?.text ?? '').startsWith('Round 2: fix only these.'), String(iso4.steers[iso4.steers.length - 1]?.text ?? '').slice(0, 160));
 }
+
 
 check(
   '假 ctx 全程按宿主契约校验实参形状（startContinuable / prompt / sendMessage 均带 signal）',

@@ -500,6 +500,13 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.2（紧急修复：0.3.1 的 pipeline_submit 让 plan/review 阶段全部派发失败）**：
+  - **事故**：0.3.1 给只读阶段（plan / review）的 `tools.restrict` 白名单加了插件私有工具名 `pipeline_submit`。宿主的 `tools.restrict()` **只接受全局注册的工具名**——它校验 `view(scope).restrictableNames`（`packages/core/tools/src/index.ts:1094-1098`），而这个集合只由**全局层 + 祖先作用域层**构成（`index.ts:1167-1189`），**作用域自己注册的工具不在其中**。结果 `subagent_plan` / `subagent_review` 的派发在子代理组合阶段直接抛 `tools.restrict() names unknown global tool` 而全部失败，插件把它归类为阶段不可用，主代理按协议停止整个任务。
+  - **修法**：回退为**单通道**——阶段回执只走「最终回复里的一个 json 围栏」，插件在 `subagent/end` 解析并做语义校验。删除了 `pipeline_submit` 工具、它的子代理注入、以及只读白名单里的那个名字；`READ_ONLY_TOOLS` 旁边写明了「这里的名字必须全部是宿主全局工具」的原因与反例。
+  - **校验没有丢**：`validateEnvelope` 仍在每次解析后执行，结果写进回执的 `validationProblems`（并在日志里 warn）。它不是阻塞式的：`pipeline_result` 把它交给编排者，由编排者决定不按该回执行动——代价是子代理要等到下一轮才知道自己被拒，换来的是「不存在一整类派发失败」。协议同步说明：拿到 `validationProblems` 时不得照单执行。
+  - 额外硬化：解析只认带 `kind` 的对象——最终回复里出现无关的 json 代码示例时，报 `parsed:false`（reason = no stage envelope）而不是「提交了非法回执」。
+  - **回归测试**：H3 现在直接读插件源码断言 `READ_ONLY_TOOLS` 里不含 `pipeline_submit` / `subagent_` 这类私有名（点名这次事故）；H4–H7 覆盖解析、三条语义拒绝、非 envelope 的 json、新一轮激活作废旧回执。断言数 **196 → 192**（删掉围绕已移除工具的 4 条，新增 5 条），0 failure。
+  - 版本 0.3.1 → 0.3.2。装回本版后 plan / review 恢复正常。
 - **0.3.1（结构化 I/O：pipeline_submit + pipeline_result + 结构化投递 + 轮次遥测）**：
   - **问题**：阶段子代理的结论全是自由文本——review 的 verdict 与 issue 列表、plan 的 Workstreams 表、impl 的变更摘要，都要主代理「读文本再抄一遍」。0.3.0 的裁决白名单因此只能靠模型逐条判断，而 reviewer 的硬约束（没有触发场景不得 blocking、docs/style 不得 blocking）也还只是 persona 里的劝告。
   - **回执结构化**：三个阶段各有 envelope（`plan` / `impl` / `review`，见 `ENVELOPE_SCHEMAS`），随每次派发在 `requiredOutput` 里下发（子代理不必猜形状）。两条通道写进同一台账：① 插件给**阶段子代理**注入窄工具 `pipeline_submit`（靠 `agent.options.stageKey` 识别，不靠台账——`dispatched` 要等 `startContinuable` 返回后才写入），在**调用点**做 schema + 语义校验，不合格当场打回、子代理当轮即可修正；② 兜底：`subagent/end` 从最终回复的最后一个 `json` 围栏解析。解析失败**不阻塞**，`pipeline_result` 如实返回 `{parsed:false, reason}`。
