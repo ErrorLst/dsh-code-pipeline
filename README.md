@@ -437,7 +437,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 197 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 199 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -500,6 +500,13 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.4（读卫生提醒的判定重写：0.3.3 的实现在真实会话里一次都没开火）**：
+  - **实测证据**：`zy_platform_frontend` 工作区的 plan 阶段子代理（session `2efd29ae-b1bc-47a7-8703-1957f1fd0381`，10:14–10:18）跑了 **33 步 / 32 个 `run_code` 程序 / 61 次嵌套 read / 46 个文件**，累计 **2,575,535 tokens**（input 133,871 + cacheRead 2,399,488 + output 42,176），而 0.3.3 的 read-hygiene 提醒一次都没出现——尽管 `settings-plugin.spec.ts` 等文件确实被重复读。
+  - **为什么没开火（两处判定太窄）**：① `lastReads` 每个 agent 只存**一条**「上一次读」，而真实会话里同一文件的多次读几乎总被其它文件的读隔开（例如 `host-services.ts` 读 `1+3000`、中间隔了 5 个文件、再读 `1+2000`）——单槽位在第二次就被重置；② 要求两个窗口「重叠或首尾相接」，于是 `loader.spec.ts` 的 `100+60 → 900+60 → 1100+60` 这种**带间隔的分页**也全部逃掉。
+  - **新判定**：按 **agent → 文件 → 读取历史**记（不再单槽位）；只看**不同 `rootCallId`**（同一次 `run_code` 程序内的多次读是我们要鼓励的批量化，豁免）；命中任一即提醒，且每个文件只提醒一次：**窗口重叠**（重读已有行）或**两边都是小窗口**（`limit < 2000`，一步读一块）。文件超过工具上限时的被迫分块（满窗、不重叠）仍然豁免。
+  - **验证**：把这次会话真实的 61 次读按原顺序灌进新判定 → **11 次提醒**，正好覆盖 6 个「整文件重读两遍」的文件（`host-services.ts` / `ipc-contract.ts` / `ipc.ts` / `index.ts` / `index.d.ts` / `bridge.ts`）与分页读的文件（`loader.spec.ts` / `plugin-model.md` / `plugin-host.spec.ts` / `settings-plugin.spec.ts` / spill 文件）。冒烟 I1–I7 覆盖：同一程序内重复读不提醒、跨步骤且被隔开也提醒、只提醒一次、被迫分块豁免、整文件重读提醒、非 read 不触发；断言数 **197 → 199**、0 failure。
+  - 顺带确认：这条 hook 在真实进程里是生效的——0.3.3 的提醒在本会话里被真实触发过一次（读 `lib/index.js` 时），所以问题出在判定，不在通道。
+  - 版本 0.3.3 → 0.3.4。
 - **0.3.3（读经济学：批量读 + 增量读提醒；只改提示词、预设文本与一条 plugin 提醒，无派发路径改动）**：
   - **问题**：宿主 agent loop 没有步数上限（`packages/core/agent-loop/src/agent.ts` 的 `turn()` 是没有计数器的 `while (true)`），而每多走一步都要重发整个上下文——于是「读一点、再读一点」比「一次读完」贵得多，上下文最后可能只有 ~200k 而累计 token 到 5M。此前协议只说了 "bundling ... into as few programs as practical"，那是能力提示，不是成本说明。
   - **把账写进 persona**：plan / impl / review 三个 persona 各加一段 READ ECONOMICS——合并一步省下≈整个上下文；多读 `W` 只随上下文重发一次、代价≈`W × 剩余步数`；侦察一次（glob/grep）→ 一个程序里 `Promise.all` 读完所有需要的文件/区间 → 不重复读；也不要整仓乱读。impl 额外要求「第一次编辑前，把本 workstream `owned files` 全部一次读完」。

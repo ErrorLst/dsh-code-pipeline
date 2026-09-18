@@ -1893,31 +1893,42 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
 }
 
 
-// ── I. 读卫生：同一文件分块续读时的 plugin 提醒（tools/post-execute）──────────
+// ── I. 读卫生：同一文件跨步骤重复读时的 plugin 提醒（tools/post-execute）────────
 {
   const hi = await newHarness('read-hygiene', capStages(0));
   const postExecute = (hi.handlers.get('tools/post-execute') ?? []).at(-1);
   const downstream = async () => ({ kind: 'accept' });
   const reader = { id: 'read-hygiene-agent' };
-  const call = (name, args) => postExecute({ agent: reader, name, arguments: args }, {}, downstream);
+  const call = (programId, name, args) => postExecute({ agent: reader, rootCallId: programId, callId: programId + ':1', name, arguments: args }, {}, downstream);
   check('I1 读卫生监听器已注册', typeof postExecute === 'function');
-  await call('read', { file_path: '/tmp/rh.js', offset: 1, limit: 100 });
-  const chunked = await call('read', { file_path: '/tmp/rh.js', offset: 101, limit: 100 });
+  // 同一 run_code 程序里的两次读 = 我们要鼓励的批量化，不提醒。
+  await call('prog-batch', 'read', { file_path: '/tmp/rh0.js', offset: 1, limit: 100 });
+  const batched = await call('prog-batch', 'read', { file_path: '/tmp/rh0.js', offset: 101, limit: 100 });
+  check('I2 同一程序内的重复读不提醒（那正是批量化）', batched?.additionalContexts === undefined, JSON.stringify(batched).slice(0, 120));
+  // 跨步骤、且被另一个文件的读隔开 —— 0.3.3 漏掉的正是这种。
+  await call('prog-1', 'read', { file_path: '/tmp/rh.js', offset: 1, limit: 100 });
+  await call('prog-2', 'read', { file_path: '/tmp/other.js', offset: 1, limit: 100 });
+  const chunked = await call('prog-3', 'read', { file_path: '/tmp/rh.js', offset: 101, limit: 100 });
   check(
-    'I2 同一文件分块续读 → 挂上 plugin 来源的读卫生提醒',
+    'I3 跨步骤同文件重复读 → 提醒（被其它文件隔开也算）',
     chunked?.additionalContexts?.length === 1
       && chunked.additionalContexts[0].source?.kind === 'plugin'
       && chunked.additionalContexts[0].role === 'user'
       && String(chunked.additionalContexts[0].content?.[0]?.text ?? '').includes('read-hygiene'),
     JSON.stringify(chunked?.additionalContexts ?? []).slice(0, 200),
   );
-  const third = await call('read', { file_path: '/tmp/rh.js', offset: 201, limit: 100 });
-  check('I3 同一文件只提醒一次', third?.additionalContexts === undefined, JSON.stringify(third).slice(0, 120));
-  await call('read', { file_path: '/tmp/rh2.js', offset: 1, limit: 2000 });
-  const capped = await call('read', { file_path: '/tmp/rh2.js', offset: 2001, limit: 2000 });
-  check('I4 到工具上限后的分块不提醒（分块是被迫的）', capped?.additionalContexts === undefined, JSON.stringify(capped).slice(0, 120));
-  const grep = await call('grep', { pattern: 'x' });
-  check('I5 非 read 工具不触发', grep?.additionalContexts === undefined, JSON.stringify(grep).slice(0, 120));
+  const third = await call('prog-4', 'read', { file_path: '/tmp/rh.js', offset: 201, limit: 100 });
+  check('I4 同一文件只提醒一次', third?.additionalContexts === undefined, JSON.stringify(third).slice(0, 120));
+  // 满窗、不重叠 = 文件超过工具上限时的被迫分块，不提醒。
+  await call('prog-5', 'read', { file_path: '/tmp/rh2.js', offset: 1, limit: 2000 });
+  const capped = await call('prog-6', 'read', { file_path: '/tmp/rh2.js', offset: 2001, limit: 2000 });
+  check('I5 满窗且不重叠的被迫分块不提醒', capped?.additionalContexts === undefined, JSON.stringify(capped).slice(0, 120));
+  // 整文件重读（窗口重叠）→ 提醒。
+  await call('prog-7', 'read', { file_path: '/tmp/rh3.js', offset: 1, limit: 3000 });
+  const rereadWhole = await call('prog-8', 'read', { file_path: '/tmp/rh3.js', offset: 1, limit: 2000 });
+  check('I6 整文件重读（窗口重叠）→ 提醒', rereadWhole?.additionalContexts?.length === 1, JSON.stringify(rereadWhole?.additionalContexts ?? []).slice(0, 160));
+  const grep = await call('prog-9', 'grep', { pattern: 'x' });
+  check('I7 非 read 工具不触发', grep?.additionalContexts === undefined, JSON.stringify(grep).slice(0, 120));
 }
 
 check(
