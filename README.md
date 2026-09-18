@@ -438,7 +438,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 200 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 202 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -486,7 +486,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
   或者一句话 `Workstreams: single workstream`（小改动 / 单文件 / 本质上串行）。硬规则：任一文件只能出现在一个
   workstream；共享串行点（`package.json`、lockfile、`index`/barrel、迁移、生成物）收进最后一个 `integration`
   workstream（依赖其余）；一个 workstream 必须值得独占一个子代理（大致 >1 个文件或 >15 分钟），不要把一件
-  连贯的改动静默拆成无法各自验证的碎片；每个 workstream 自带验收检查。
+  连贯的改动静默拆成无法各自验证的碎片；每个 workstream 自带验收检查。反过来也要有上界：一个 impl child 按 `steps × context` 计费，把多组不相关交付物（契约 + 服务 + 门禁 + 外壳 + 配置 + 文档）捆成一个 workstream 会把它拖成 50+ 步、数百万 token 的重发——必须拆成多个 workstream。
 - **主代理（预设 persona）**：当计划声明 ≥2 个「文件不相交且无依赖」的 workstream、**且任务属 T2**（并行写是例外而非默认）时，可以在一个程序里并行派发
   每个独立 workstream 一个 `subagent_impl`（`Promise.all`，并行度受该阶段**运行上限**约束：
   超出时剩余工作流在后续步骤各自新派、等名额释放，**不要**塞给不相干的已有子代理）；
@@ -499,6 +499,11 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.4.2（上下文预算纪律：把「程序即上下文边界」写进三段 persona 与预设；工作流粒度加上界）**：
+  - **根因**：实测一个 impl 子代理单轮 **62 步、`totalTokens` 13,020,339**，其中 **97% 是 cacheRead**——`usage.totalTokens = input + output + cacheRead` 按步累加，每步都把整段上下文重发一遍。按内容拆这段上下文：**模型自己的 reasoning 占 41%**、工具结果 37%、`run_code` 程序源码（工具调用实参）18%、system + 派发 3%。关键事实：`tool/ptc-dispatch` 里「程序读进来但没打印」的文件内容**根本不进上下文**，真正留在历史里的只有 **`console.log` 打印出来的东西**（实测把一份大文件的头部在两个相邻步骤里几乎原样打印了两遍、一条 38KB 的测试输出直接驻留到结束）。所以省 token 的两个杠杆是：**步数**（每步重发整段上下文，成本近似 `steps × context`）与**打印量**（每字符按剩余步数计费）。
+  - **做法（协议层，不改插件逻辑）**：三段阶段 persona 的 `READ ECONOMICS` 改写为 `CONTEXT ECONOMICS`——明确「`run_code` 程序就是上下文边界：程序内部的 read / grep / 命令不花钱，只有 PRINT 或 return 的才进历史，且每步重发」，要求只打印要用的蒸馏结果、不重复打印、读-改在同一个程序里；impl persona 追加**有界验证输出**（`| tail -25` / `grep -E 'error|FAIL|Tests '`，每个逻辑块只跑一次检查）；plan persona 追加**工作流粒度上界**（把契约 + 服务 + 门禁 + 外壳 + 配置 + 文档捆进一个 workstream 会拖成 50+ 步、数百万 token，必须拆开）。预设 `### Step economy` 由「读一次、读宽」改写为「程序即上下文边界」，新增「命令输出有界」一条，`Workstreams` 段同步粒度上界。
+  - **验证**：冒烟 E15/E16（预设与三段 persona 的上下文预算锚点）。断言数 **200 → 202**、0 failure。
+  - 版本 0.4.1 → 0.4.2。**预设改动需要手动同步**（自动安装不覆盖已有预设）。
 - **0.4.1（并发上限按会话独立：设置页不再把跨会话运行数合计后比上限）**：
   - **问题**：准入判定一直以 `parent.id` 为键（A 会话跑满不会占 B 会话名额），但设置页读的 `/dsh-code-pipeline/status` 把**所有会话**的运行数/在途数相加后返回成 `running`/`pending`，于是卡片显示成「当前运行 3 / 上限 2」——把「每个会话独立」误显示成「所有会话合计」。
   - **做法**：status 的 `running` / `pending` 改为**单会话最多**（与 `limit` 同口径），新增 `sessions` / `totalRunning` / `totalPending` 作为跨会话合计（仅诊断）；设置卡片改为「当前运行（单会话最多）N / 单会话上限 M；共 K 个会话在跑（合计 T）」。`created` / `available` 标注为「全部会话」。

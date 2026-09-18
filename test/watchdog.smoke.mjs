@@ -1061,6 +1061,21 @@ const attemptFollowup = async (harness, child, message, compact) => {
     persona.includes('subagent.maxActiveSubagents')
       && persona.includes('TRANSIENT CAPACITY REJECTION'),
   );
+  check(
+    'E15 上下文预算锚点：程序即上下文边界 + 只打印蒸馏结果 + 有界命令输出 + 工作流粒度上限',
+    persona.includes('### Step economy (the program is the context boundary)')
+      && persona.includes('never print the same material twice')
+      && persona.includes("Bound every command's output")
+      && persona.includes('Keep each workstream small enough for ONE child to finish in a few dozen steps'),
+  );
+  check(
+    'E16 阶段 persona 同步上下文预算纪律（程序即边界 + 有界验证输出 + 工作流粒度上限）',
+    pluginSource.includes('CONTEXT ECONOMICS')
+      && pluginSource.includes('IS the context boundary')
+      && pluginSource.includes('never re-print material already in your history')
+      && pluginSource.includes("BOUND every check's output")
+      && pluginSource.includes('Keep each workstream SMALL ENOUGH to finish in a few dozen steps'),
+  );
   check('E6 冷子代理锚点在 persona 里（A cold child cannot be compacted）', persona.includes('A cold child cannot be compacted'));
   check(
     'E7 评审第 2 轮只送增量：新锚点在、旧的 FULL NEW diff 措辞已消失',
