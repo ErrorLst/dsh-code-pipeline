@@ -295,6 +295,14 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   2. **创建上限**：该阶段**已经创建过**的子代理总数——含已结束（settle / 被墙钟硬停 /
      `lost`）的；同一 workstream 的多轮复用**不**占新名额（复用不创建）。
   `0` = 不限制（默认，零回归）。
+- **plan 派发时会被告知这份预算**（0.3.9）：`subagent_plan` 的派发消息里多一段
+  **`parallelismBudget`**——本会话该 impl 上限 / 已创建 / 剩余可创建，并**要求**
+  `## Workstreams` 表最多只有「剩余」个工作流：超出就**合并**并排出显式**串行顺序**
+  （谁先跑、谁等谁、后者继承什么）；剩余 = 1 时要求排成单一串行序列，剩余 = 0 时要求
+  说明只能追加到已有实现者。根因：plan 切 5 个工作流而上限是 2，后 3 个只能被塞进已做过
+  别的 workstream 的冷 child（无法压缩），实测那一轮 **63 步 / 9.7M tokens**。这个数字是
+  **提示**（取自本进程台账 ∪ 最近一次成功观测的高水位，不做 I/O）：dsh 重启后台账为空时
+  可能低估已创建数，真正的准入仍由派发时的两道闸门判定。
 - **两道闸门共用一个值，且运行闸门先判**：一次派发先过运行闸门、再过创建闸门。所以上限
   较小时，**第 1 个子代理还在跑**时紧跟着的第 2 次派发会先撞**运行上限**（这条错误文案只带
   一句「复用永远可用」的提醒，不带清单）；等它**结束之后**再派才撞**创建上限**（这条文案才
@@ -443,7 +451,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 213 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 217 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -506,6 +514,11 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.9（让 plan 一开始就知道实现者的创建预算，切出可执行的串行计划）**：
+  - **根因**：0.3.8 记录的 63 步那一轮，成因是 plan 切了 **5 个工作流**（A–E）而 impl 创建上限是 **2**——后 3 个只能被塞进已经做过别的 workstream 的冷 child（无法压缩），正是「跨工作流复用」最贵的形态。上个版本只在**撞上限之后**补救（写明代价 + 优先级），这个版本把预算**提前告诉规划者**。
+  - **做法**：`subagent_plan` 的派发消息新增 **`parallelismBudget`** 块（`stageParallelBudget` 计算，与创建上限准入同源——本进程台账 ∪ 最近一次成功观测的高水位，不做 I/O）：写明该 impl 上限 / 已创建 / 剩余可创建，并**要求** `## Workstreams` 表最多只有「剩余」个工作流；超出时必须**合并**并排出显式**串行顺序**（谁先跑、谁等谁、后者继承什么），剩余 = 1 时要求排成单一串行序列，剩余 = 0 时要求说明只能追加到已有实现者。上限为 0（不限制）时改为提示宿主的存活上限（默认 8）。该块**只给 plan**（impl/review 派发不含）。plan persona 的 `BUDGET FIRST` 与预设的 Workstreams 段落同步。
+  - **验证**：冒烟 M1（上限 2 → 派发带 `parallelismBudget` 且要求 ≤ 2 个工作流）、M2（上限 1 → 要求单一串行序列）、M3（上限 0 → 说明无插件侧上限并提示宿主上限）、M4（预算块只给 plan）。断言数 **213 → 217**、0 failure。
+  - 版本 0.3.8 → 0.3.9。**预设改动需要手动同步**（自动安装不覆盖已有预设）。
 - **0.3.8（复用路径丢掉了 `files` 契约；创建上限把「跨工作流复用」变成最贵的一轮；impl 批量纪律）**：
   - **实测证据**（`zy_platform_frontend`：impl A `a62f32bb`、impl B `ec281c36`、review `d38977c7`、主会话 `session-5556e686`）：主会话第 5 轮想**并行派发 impl B + impl C**，`subagent_impl` 被创建上限拒绝（limit 2，已创建 A/B）→ 按协议复用 A 去干 **Workstream C**（另一个工作流、另一批文件），于是 A 的第 2 轮 **63 步 / 9.7M tokens**（比第一轮 41 步还长），每步重发约 **152k** 累积上下文；review 侧同因：`stage concurrency limit (limit 1)` 与 `stage CREATION limit (limit 1)` 让第二个 reviewer 从未被创建。另外两处形状问题：① 复用路径只发一段自由文本、**没有 `files`**，A 的第 2 轮开头 **7 步 / 15 次 read** 全在重新发现 core-settings 的文件；② impl **41–60% 的步只发一个工具调用**（plan 17% / review 0–20%），DSH 自带的 `repeat-tool-reminder` 在其中触发了 `read × 3` / `read × 5`。
   - **做法（复用路径接回 `files`）**：`pipeline_followup` 新增**必填** `files`，与三个阶段工具共用 `renderFilesBlock`——真清单渲染成「先用一个 `run_code` 程序读完」，`-` 显式声明没有清单；省略 → 拒绝并点名 `files`。

@@ -2009,6 +2009,39 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   check('K2 files "-" → 允许，且子代理收到「自己做侦察」指令', declaredNone.ok === true && kPrompt.includes('NO candidate list'), JSON.stringify({ ok: declaredNone.ok, snippet: kPrompt.slice(0, 130) }));
 }
 
+// ── M. plan 的并行预算：派发时告诉规划者本会话还能创建几个实现者 ─────────────
+{
+  const { readFileSync } = await import('node:fs');
+  const promptOf = (harness) => {
+    let text = String(harness.calls.startPrompts.at(-1) ?? '');
+    if (!text.includes('parallelismBudget')) {
+      const m = text.match(/written to temp file: (\S+)/);
+      if (m) { try { text = readFileSync(m[1], 'utf8'); } catch {} }
+    }
+    return text;
+  };
+  const sliceFrom = (text, marker, span) => { const at = text.indexOf(marker); return at === -1 ? text.slice(0, span) : text.slice(at, at + span); };
+  const capped = await newHarness('plan-budget-capped', capStages(2));
+  await attempt(capped, 'subagent_plan', { description: 'budget 2' });
+  const cappedPrompt = promptOf(capped);
+  check(
+    'M1 impl 上限 2 → plan 派发带上 parallelismBudget，且要求 ≤ 2 个工作流',
+    cappedPrompt.includes('**parallelismBudget**') && cappedPrompt.includes('AT MOST 2 workstream(s)'),
+    sliceFrom(cappedPrompt, '**parallelismBudget**', 260),
+  );
+  const one = await newHarness('plan-budget-one', capStages(1));
+  await attempt(one, 'subagent_plan', { description: 'budget 1' });
+  const onePrompt = promptOf(one);
+  check('M2 预算 1 → 要求排成单一串行序列（不是并行工作流）', onePrompt.includes('The budget is 1') && onePrompt.includes('single SERIAL sequence'), sliceFrom(onePrompt, '**parallelismBudget**', 300));
+  const unlimited = await newHarness('plan-budget-unlimited', capStages(0));
+  await attempt(unlimited, 'subagent_plan', { description: 'budget 0' });
+  const unlimitedPrompt = promptOf(unlimited);
+  check('M3 上限 0（不限制）→ 说明无插件侧上限，仍提示宿主存活上限', unlimitedPrompt.includes('No plugin-side creation limit is configured') && unlimitedPrompt.includes('default 8'), sliceFrom(unlimitedPrompt, '**parallelismBudget**', 200));
+  const implOnly = await newHarness('plan-budget-impl', capStages(2));
+  await attempt(implOnly, 'subagent_impl', { description: 'no budget block' });
+  check('M4 预算块只给 plan（impl 派发里没有 parallelismBudget）', !promptOf(implOnly).includes('parallelismBudget'), promptOf(implOnly).slice(0, 160));
+}
+
 check(
   '假 ctx 全程按宿主契约校验实参形状（startContinuable / prompt / sendMessage 均带 signal）',
   h.calls.startSignals.length > 0
