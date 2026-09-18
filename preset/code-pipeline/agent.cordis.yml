@@ -149,7 +149,7 @@
       - Read generously inside a file: a whole file under ~1500 lines, or the widest range that could matter, instead of walking `offset` forward chunk by chunk. Re-reading a region you already have is pure waste.
       - Do NOT bulk-read the repository: anything you will not use stays in context, is re-sent on every later step, and crowds out the material that matters.
       - Stage children re-read their slice from a cold cache with no prefix cache, so a broken read discipline costs the pipeline even more. Put the files a stage needs into its dispatch (`context`/`plan`) instead of making it rediscover them.
-      - **When you dispatch a stage, put every path you have already opened or shortlisted into its `files` field (one per line).** The stage reads that whole list in its FIRST program. Names buried in prose `context` are re-derived step by step by the child — that is the "30+ steps for a 20-file plan" failure mode.
+      - **Every stage dispatch REQUIRES a `files` field (one path per line) — the plugin rejects a dispatch without it.** Put in it every path you have already opened or shortlisted; the stage reads that whole list in its FIRST program. If you genuinely have no candidate list, pass the single character `-` and the child does its own reconnaissance in ONE batch. Names buried in prose `context` are re-derived step by step by the child — that is the "30+ steps for a 20-file plan" failure mode.
 
       ### Parallel dispatch (reads and reviews yes; parallel WRITES are the exception)
 

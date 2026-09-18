@@ -437,7 +437,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 202 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 204 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -500,6 +500,11 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.6（`files` 从「可选、靠协议」升级为必填派发契约）**：
+  - **问题**：0.3.5 给三个阶段加了 `files` 并写了协议，但它是**可选的**——主代理不填，插件既不警告也不拒绝，子代理就退回「从零重新发现」，正是 0.3.5 记录的那个 20 步 / 48 文件模式。你对该机制的预期是「主会话每次都会给子代理发一份文件清单」，而可选字段给不了这个保证。
+  - **做法**：`files` 成为**必填**。缺省（undefined / 空串）时派发直接被拒，错误信息点名 `files` 并给出两种合法写法：① 一行一个路径的候选清单；② 单个 `-`，显式声明「没有候选清单」。后一种让子代理收到一段「自己做侦察（glob/grep），但仍要在一个程序里把候选读完」的指令——它保证主代理**总是有意识地做出选择**，而不是静默省略。三个工具的 CONTRACT description 改为 `files (REQUIRED …)`，persona 改为「dispatch 总是带 `files`；为 `-` 时自己做侦察」，预设 `### Step economy` 对应条目同步写明「缺省会被拒绝」。
+  - **验证**：冒烟 K1（缺 `files` → 拒绝且错误点名 files）、K2（`files: "-"` → 放行且子代理收到 NO candidate list 指令）；J1 改为断言 schema 的 `parameters.properties` 真的含 `files`。断言数 **202 → 204**、0 failure。
+  - 版本 0.3.5 → 0.3.6。**预设改动需要手动同步**（自动安装不覆盖已有预设）。
 - **0.3.5（把「该读哪些文件」变成派发契约的 `files` 字段：主会话已侦察、plan 仍从零重读）**：
   - **实测证据**（`zy_platform_frontend`，主会话 `session-92a50bf5` + plan 子代理 `6358a69f`）：主会话用 15 步读了 **33 个文件**再派发 plan；派发消息（8189 字符）里其实有一整节 `## 仓库现状（已替你核实，可直接采信）`，按文件+行号列出 `plugin-api/src/context.ts`、`host-services.ts`、`host-context.ts`、`config-service.ts`、`plugin-host.ts`、`host-info.ts`、`main.ts`、`App.vue`、`stores/app.ts`、`ipc-contract.ts`、`preload/index.ts`、`main/ipc.ts`、`main/window.ts`、`core-settings/*`、测试与文档……**清单是发过去了**；但 plan 仍然用了 **20 步 / 56 次 read / 48 个文件**，其中约 30 个是主会话刚读过的同一批。
   - **三个原因**：① 清单是**散文**（路径嵌在中文叙述里），子代理要先「再解析」一遍；② 派发明写「仍建议你按需打开原文件确认细节」，persona 又写「verify by reading the actual code」——两句都在推它逐个开文件；③ 没有任何指令说「先一次性读完这份清单」。0.3.4 的读卫生提醒在这一轮**确实触发了**，20 步也没有降下来：所以问题在派发契约，不在提醒强度。

@@ -276,7 +276,7 @@ check(
 );
 
 const dispatch = (toolName, args = {}) => h.tools.get(toolName).execute(
-  { prompt: 'do the thing', ...args },
+  { prompt: 'do the thing', files: '-', ...args },
   { agent: h.parent, signal: new AbortController().signal },
 );
 const statusOf = async () => {
@@ -575,7 +575,7 @@ async function newHarness(parentId, stages) {
   return harness;
 }
 const runStage = (harness, toolName, args = {}) => harness.tools.get(toolName).execute(
-  { prompt: 'do the thing', ...args },
+  { prompt: 'do the thing', files: '-', ...args },
   { agent: harness.parent, signal: new AbortController().signal },
 );
 const runFollowup = (harness, child, message, compact) => harness.tools.get('pipeline_followup').execute(
@@ -1937,7 +1937,7 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   const { readFileSync } = await import('node:fs');
   const hj = await newHarness('files-plumbing', capStages(0));
   const planDef = hj.tools.get('subagent_plan');
-  check('J1 subagent_plan 的入参 schema 暴露 files 字段', JSON.stringify(planDef).includes('"files"'), Object.keys(planDef?.input?.schema?.properties ?? {}).join(','));
+  check('J1 subagent_plan 的入参 schema 暴露 files 字段', 'files' in (planDef?.parameters?.properties ?? {}), Object.keys(planDef?.parameters?.properties ?? {}).join(','));
   const dispatch = await attempt(hj, 'subagent_plan', { prompt: 'Plan the change.', files: 'packages/plugin-api/src/context.ts\napps/desktop/src/shared/ipc-contract.ts' });
   check('J2 带 files 的派发成功', dispatch.ok === true, JSON.stringify(dispatch).slice(0, 160));
   let childPrompt = String(hj.calls.startPrompts.at(-1) ?? '');
@@ -1952,6 +1952,21 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
       && childPrompt.includes('apps/desktop/src/shared/ipc-contract.ts'),
     childPrompt.slice(Math.max(0, childPrompt.indexOf('**files**')), childPrompt.indexOf('**files**') + 240),
   );
+}
+
+// ── K. files 必填：缺省拒绝、显式 "-" 允许 ──────────────────────────────────
+{
+  const { readFileSync } = await import('node:fs');
+  const hk = await newHarness('files-required', capStages(0));
+  const missing = await attemptTool(hk.tools.get('subagent_plan'), { prompt: 'Plan the change.' }, hk.parent);
+  check('K1 缺 files → 派发被拒且错误点名 files', missing.ok === false && String(missing.message).includes('\"files\" is required'), String(missing.message).slice(0, 170));
+  const declaredNone = await attempt(hk, 'subagent_plan', { prompt: 'Plan the change.', files: '-' });
+  let kPrompt = String(hk.calls.startPrompts.at(-1) ?? '');
+  if (!kPrompt.includes('**files**')) {
+    const m = kPrompt.match(/written to temp file: (\S+)/);
+    if (m) { try { kPrompt = readFileSync(m[1], 'utf8'); } catch {} }
+  }
+  check('K2 files "-" → 允许，且子代理收到「自己做侦察」指令', declaredNone.ok === true && kPrompt.includes('NO candidate list'), JSON.stringify({ ok: declaredNone.ok, snippet: kPrompt.slice(0, 130) }));
 }
 
 check(
