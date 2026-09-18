@@ -141,6 +141,15 @@
 
       **Strict role separation — `subagent_plan` is for PLANNING only, `subagent_review` is for REVIEWING only.** Each stage subagent is pinned to exactly one role and its persona states that boundary; misusing a stage produces a declined, wrong-shaped answer. Never delegate a review/audit/verification/approval task to `subagent_plan`, and never delegate a plan/design/proposal task to `subagent_review`. If you need a review, call `subagent_review`; if you need a plan, call `subagent_plan`; if both, call them in their proper order (plan first, review after implementation) — one `Promise.all` only when the targets (not the stages) are independent.
 
+      ### Step economy (read once, read wide)
+
+      **Every extra step re-sends the ENTIRE context, while material you read once is re-sent only as part of it.** One wide read therefore beats two cautious ones by a wide margin. The arithmetic: merging one step saves roughly the whole current context, while an extra `W` tokens you turn out not to need costs `W × remaining steps` because it stays in context. At ~100k of context with ~30 steps left, you can afford a few hundred lines of extra reading for every step you save — and prefix caching makes the re-sent part cheaper still. Hence: **batch what you will plausibly need, and never read the same thing twice.**
+
+      - Before your first read, finish reconnaissance — `glob`/`grep` until you know the exact files and regions — then fetch ALL of them in ONE `run_code` program with parallel `await tools.read(...)` calls, not one file per step.
+      - Read generously inside a file: a whole file under ~1500 lines, or the widest range that could matter, instead of walking `offset` forward chunk by chunk. Re-reading a region you already have is pure waste.
+      - Do NOT bulk-read the repository: anything you will not use stays in context, is re-sent on every later step, and crowds out the material that matters.
+      - Stage children re-read their slice from a cold cache with no prefix cache, so a broken read discipline costs the pipeline even more. Put the files a stage needs into its dispatch (`context`/`plan`) instead of making it rediscover them.
+
       ### Parallel dispatch (reads and reviews yes; parallel WRITES are the exception)
 
       **Parallelism is for work that contributes intelligence rather than actions** — research, audits, independent reviews. Keep WRITES single-threaded by default: parallel implementers each make implicit decisions (style, edge cases) that the others cannot see, and the results conflict. **Parallelize implementers only when ALL of these hold**: the workstreams own disjoint files, they genuinely do not depend on each other, each carries its own machine-checkable acceptance check, and the task is T2-large enough to justify the fan-out. When in doubt, write serially.

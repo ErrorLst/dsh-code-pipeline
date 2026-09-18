@@ -437,7 +437,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 167 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 197 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -500,6 +500,13 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.3（读经济学：批量读 + 增量读提醒；只改提示词、预设文本与一条 plugin 提醒，无派发路径改动）**：
+  - **问题**：宿主 agent loop 没有步数上限（`packages/core/agent-loop/src/agent.ts` 的 `turn()` 是没有计数器的 `while (true)`），而每多走一步都要重发整个上下文——于是「读一点、再读一点」比「一次读完」贵得多，上下文最后可能只有 ~200k 而累计 token 到 5M。此前协议只说了 "bundling ... into as few programs as practical"，那是能力提示，不是成本说明。
+  - **把账写进 persona**：plan / impl / review 三个 persona 各加一段 READ ECONOMICS——合并一步省下≈整个上下文；多读 `W` 只随上下文重发一次、代价≈`W × 剩余步数`；侦察一次（glob/grep）→ 一个程序里 `Promise.all` 读完所有需要的文件/区间 → 不重复读；也不要整仓乱读。impl 额外要求「第一次编辑前，把本 workstream `owned files` 全部一次读完」。
+  - **把账写进主代理协议**：预设新增 `### Step economy (read once, read wide)` 小节（同一公式 + 四条纪律，含「把阶段要读的文件放进它派发的 `context`/`plan`，别让它自己去重新发现」）。
+  - **机制侧兜底**：新增 `tools/post-execute` 监听（`{ global: true }`），按 agent 记录上一次 `read` 的窗口；同一文件被切成小窗口续读（重叠/首尾相接）时挂一条 `{kind:'plugin'}` 来源的 read-hygiene 提醒。只在两个窗口都小于 read 工具上限（2000 行）时开火——文件本身超过上限时分块是被迫的；同一文件只提醒一次。只提醒不否决，观察与富化全程 try/catch（宿主里 post-execute 监听器抛错会被记成 `isError`）。
+  - **验证**：决策表单测（分块续读 / 同区间重读 → 提醒；有间隔 / 差异文件 / 到上限 / 非 read / 无 agent → 不提醒；第三次不重复）＋冒烟新增 I1–I5。断言数 **192 → 197**、0 failure。写在 `run_code` 里的分块读同样会被捕获：PTC 的嵌套调用继承 `exec.agent`（`packages/core/tools/src/ptc.ts:545`）并经 `deferContext` 把 `additionalContexts` 传回外层程序结果。
+  - 版本 0.3.2 → 0.3.3。**预设改动需要手动同步**（插件自动安装不覆盖已有预设文件）。
 - **0.3.2（紧急修复：0.3.1 的 pipeline_submit 让 plan/review 阶段全部派发失败）**：
   - **事故**：0.3.1 给只读阶段（plan / review）的 `tools.restrict` 白名单加了插件私有工具名 `pipeline_submit`。宿主的 `tools.restrict()` **只接受全局注册的工具名**——它校验 `view(scope).restrictableNames`（`packages/core/tools/src/index.ts:1094-1098`），而这个集合只由**全局层 + 祖先作用域层**构成（`index.ts:1167-1189`），**作用域自己注册的工具不在其中**。结果 `subagent_plan` / `subagent_review` 的派发在子代理组合阶段直接抛 `tools.restrict() names unknown global tool` 而全部失败，插件把它归类为阶段不可用，主代理按协议停止整个任务。
   - **修法**：回退为**单通道**——阶段回执只走「最终回复里的一个 json 围栏」，插件在 `subagent/end` 解析并做语义校验。删除了 `pipeline_submit` 工具、它的子代理注入、以及只读白名单里的那个名字；`READ_ONLY_TOOLS` 旁边写明了「这里的名字必须全部是宿主全局工具」的原因与反例。
