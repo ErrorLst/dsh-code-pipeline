@@ -62,7 +62,7 @@ function createHarness(parentId = 'parent-1') {
   // promptPayloads 在"判定接受之前"记录每次尝试的载荷：探测表的尝试序列因此可断言
   // （光看 queued[last] 看不出中间试过哪些形状）。
   const calls = { prompt: 0, promptPayloads: [], promptSignals: [], startSignals: [], startPrompts: [], startPersonas: [], sendMessageOptions: [], rejectDelivery: false, rejectKnownShapes: false, rewriteBadPayloadMessage: false,
-    // 创建上限 / 压缩顺序断言的记账：
+    // 运行上限 / 压缩顺序断言的记账：
     //   start          —— 宿主创建入口 startContinuable 的真实调用次数（证明闸门是代码拦的）；
     //   order          —— 跨服务统一调用序列（压缩必须早于投递）；
     //   serviceForArgs —— agentPresets.serviceFor 的实参（realm 私有 compression 服务寻址）；
@@ -557,10 +557,10 @@ const shapeOf = (row) => row === undefined
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// 创建数量硬上限 + 压缩后复用 + 别名稳定（机制回归基线）
+// 运行并发上限 + 压缩后复用 + 别名稳定（机制回归基线，0.4.0 起无创建总量上限）
 // ════════════════════════════════════════════════════════════════════════════
-// 与上面的墙钟场景刻意隔离：创建数量台账是模块级、按父会话隔离、且**只增不减**的，
-// 因此每个新场景都用独立 parentId 的假 ctx（台账互不可见），childId 也全局唯一。
+// 与上面的墙钟场景刻意隔离：并发账本按父会话隔离，因此每个新场景都用独立 parentId
+// 的假 ctx（账本互不可见），childId 也全局唯一。
 
 const stageKeys = ['plan', 'impl', 'review'];
 const capStages = (maxConcurrency) => ({
@@ -606,24 +606,21 @@ const attemptFollowup = async (harness, child, message, compact) => {
   }
 };
 
-// ── A. 创建数量硬闸门（上限复用 maxConcurrency；数的是「已创建」而不是「在跑」）──
+// ── A. 运行并发闸门（上限 = 同时运行数；0.4.0 起没有「已创建总量」上限）─────────
 {
   const cap = await newHarness('parent-cap-1', capStages(1));
   const first = await attempt(cap, 'subagent_impl', { description: 'cap test one' });
   const firstId = first.result?.subagentId;
-  const firstLabel = 'impl/cap test one';
   check(
-    'A1 创建上限=1：第 1 个同阶段派发成功并返回 durable subagentId',
+    'A1 运行上限=1：第 1 个同阶段派发成功并返回 durable subagentId',
     first.ok === true && first.result?.kind === 'continuable' && typeof firstId === 'string',
     JSON.stringify(first).slice(0, 200),
   );
   const second = await attempt(cap, 'subagent_impl', { description: 'cap test two' });
-  check('A1 创建上限=1：第 2 个同阶段派发必抛（是硬闸门，不是劝说）', second.ok === false, JSON.stringify(second).slice(0, 200));
+  check('A1 运行上限=1：第 1 个仍在跑时第 2 个同阶段派发必抛（是硬闸门，不是劝说）', second.ok === false, JSON.stringify(second).slice(0, 200));
   check('A1 宿主的创建入口 startContinuable 只被调用 1 次（证明是代码拦下的）', cap.calls.start === 1, 'start ' + cap.calls.start);
-  // 第 2 次派发时第 1 个还在跑：先撞上的是「运行上限」闸门（两道闸门同级，先运行后创建）。
-  // 它同样是策略拒绝而不是阶段不可用，且必须带复用出路（否则主代理会终止整个任务）。
   check(
-    'A1 第 2 次派发被运行上限闸门拦下（stage concurrency limit reached，实际措辞）',
+    'A1 第 2 次派发被运行上限闸门拦下（stage concurrency limit reached）',
     /stage concurrency limit reached/i.test(second.message ?? ''),
     (second.message ?? '').slice(0, 160),
   );
@@ -633,48 +630,24 @@ const attemptFollowup = async (harness, child, message, compact) => {
       && !(second.message ?? '').includes('Pipeline stage UNAVAILABLE'),
     (second.message ?? '').slice(0, 200),
   );
+  check(
+    'A2 运行上限文案把「等名额释放后在后续步骤派发新孩子」写成出路，且不再出现创建闸门的跨工作流复用段',
+    (second.message ?? '').includes('fresh child')
+      && (second.message ?? '').includes('pipeline_followup')
+      && !(second.message ?? '').includes('CROSS-WORKSTREAM REUSE HAS A PRICE'),
+    (second.message ?? '').slice(0, 320),
+  );
 
-  // 结束第 1 个（subagent/end 撤销运行账本 + 宿主行改 inactive，running 归零）后仍被拒：
-  // 这一次运行闸门放行，撞上的是**创建上限**闸门 —— 它数的才是「已创建」。
+  // 结束第 1 个后运行名额释放：第 3 次派发**成功**（证明没有「已创建总量」上限）。
   cap.emit('subagent/end', { id: firstId });
-  cap.children.set(firstId, { activity: 'idle', label: firstLabel });
+  cap.children.set(firstId, { activity: 'idle', label: 'impl/cap test one' });
   const third = await attempt(cap, 'subagent_impl', { description: 'cap test three' });
-  const creationMessage = third.message ?? '';
   check(
-    'A3 子代理结束、running 归零后第 3 次派发仍被拒（数的是「已创建」而不是「在跑」）',
-    third.ok === false,
-    JSON.stringify(third).slice(0, 200),
+    'A3 子代理结束后运行名额释放：第 3 次派发成功（证明没有「已创建总量」闸门）',
+    third.ok === true,
+    JSON.stringify(third).slice(0, 240),
   );
-  check(
-    'A3 这次撞上的是创建上限闸门（实际措辞：stage CREATION limit reached）',
-    /stage CREATION limit reached/i.test(creationMessage),
-    creationMessage.slice(0, 160),
-  );
-  check('A3 创建上限文案说明「等 settle 不腾名额、只有复用才行」', creationMessage.includes('does NOT free a slot'), creationMessage.slice(0, 300));
-  check('A3 宿主的创建入口依旧只被调用 1 次（第 3 次没有真的创建）', cap.calls.start === 1, 'start ' + cap.calls.start);
-
-  // A2 文案契约：作用在「创建上限」那条错误上 —— 只有它携带可复用清单与复用出路。
-  check('A2 创建上限文案带第 1 个子代理的 id', creationMessage.includes(firstId), firstId);
-  check('A2 创建上限文案带它的 label（含阶段前缀）', creationMessage.includes(firstLabel), firstLabel);
-  check('A2 创建上限文案给出 pipeline_followup 复用出路', creationMessage.includes('pipeline_followup'));
-  check('A2b 创建上限文案写明跨工作流复用的代价与优先级', creationMessage.includes('CROSS-WORKSTREAM REUSE HAS A PRICE') && creationMessage.includes('~150k re-sent tokens per step') && creationMessage.includes('a `files` list'), creationMessage.slice(0, 260));
-  check(
-    'A2 创建上限文案不再把 compact: true 当出路，而是「压缩不掉 → 接受干扰 / 有名额才新派」',
-    creationMessage.includes('you cannot compact it away')
-      && creationMessage.includes('only while this session still has a creation slot')
-      && !creationMessage.includes('compact: true'),
-    creationMessage.slice(0, 320),
-  );
-  check(
-    'A2 创建上限文案列出的可复用清单带 id + label + 活动状态',
-    creationMessage.includes(firstId + '  "' + firstLabel + '"') && (creationMessage.includes('[running]') || creationMessage.includes('[inactive]')),
-    creationMessage.slice(0, 400),
-  );
-  check(
-    'A2 创建上限文案不带 UNAVAILABLE 指引横幅（UNAVAILABLE 只以「不要报它」的否定形式出现）',
-    !creationMessage.includes('Pipeline stage UNAVAILABLE') && !creationMessage.includes('STOP and report to the user'),
-    creationMessage.slice(0, 160),
-  );
+  check('A3 宿主创建入口被真实调用第 2 次（第 3 次真的创建了）', cap.calls.start === 2, 'start ' + cap.calls.start);
 }
 
 // A4 上限 0 = 不限制（零回归）
@@ -767,25 +740,26 @@ const attemptFollowup = async (harness, child, message, compact) => {
   check('A5 并发竞态（cap=1、Promise.all 三个）：只放行 1 个', passed.length === 1, JSON.stringify(settled.map((row) => row.ok)));
   check('A5 并发竞态：宿主创建入口只被调用 1 次（同步预留生效）', race.calls.start === 1, 'start ' + race.calls.start);
   check(
-    'A5 被拒的两个都是阶段上限拒绝（运行上限或创建上限），不是别的失败',
-    refused.length === 2 && refused.every((row) => /concurrency limit reached|CREATION limit reached/.test(row.message ?? '')),
+    'A5 被拒的两个都是运行上限拒绝（没有创建总量闸门），不是别的失败',
+    refused.length === 2 && refused.every((row) => /stage concurrency limit reached/i.test(row.message ?? '')),
     JSON.stringify(refused.map((row) => (row.message ?? '').slice(0, 90))),
   );
 }
 
-// A6 重启持久面：只靠宿主 listChildren 里带阶段前缀 label 的行也能判定已达上限
+// A6 重启持久面：宿主 listChildren 里的运行行参与并发计数（label 前缀 / live stageKey）
 {
   const persist = await newHarness('parent-persist', capStages(1));
-  persist.children.set('orphan-impl-1', { activity: 'inactive', label: 'impl/orphan from a previous process' });
+  persist.children.set('orphan-impl-1', { activity: 'running', label: 'impl/orphan from a previous process' });
   const blocked = await attempt(persist, 'subagent_impl', { description: 'after restart' });
   check(
-    'A6 台账里没有、仅靠宿主持久行的 <stage>/ 前缀 label 就让 impl 判定已达上限并被拒',
-    blocked.ok === false && /stage CREATION limit reached/i.test(blocked.message ?? ''),
+    'A6 台账里没有、仅靠宿主持久行的 <stage>/ 前缀 label，运行中的它就让 impl 判定已达运行上限并被拒',
+    blocked.ok === false && /stage concurrency limit reached/i.test(blocked.message ?? ''),
     JSON.stringify(blocked).slice(0, 220),
   );
-  check('A6 拒绝文案把这条持久行列为可复用（id + 持久 label）',
-    (blocked.message ?? '').includes('orphan-impl-1') && (blocked.message ?? '').includes('impl/orphan from a previous process'));
   check('A6 该路径没有调用宿主创建入口', persist.calls.start === 0, 'start ' + persist.calls.start);
+  persist.children.set('orphan-impl-1', { activity: 'idle', label: 'impl/orphan from a previous process' });
+  const afterIdle = await attempt(persist, 'subagent_impl', { description: 'slot freed' });
+  check('A6 持久行 idle 后不再计运行数（新派发成功）', afterIdle.ok === true, JSON.stringify(afterIdle).slice(0, 200));
   // 对照：无阶段前缀的行不归属任何阶段 —— plan 阶段照常派发。
   persist.children.set('orphan-nolabel-1', { activity: 'running', label: 'unrelated child' });
   const planOk = await attempt(persist, 'subagent_plan', { description: 'plan still works' });
@@ -797,8 +771,8 @@ const attemptFollowup = async (harness, child, message, compact) => {
   warm.children.set('warm-impl-1', { activity: 'running', label: 'no stage prefix here' });
   const warmBlocked = await attempt(warm, 'subagent_impl', { description: 'stageKey attribution' });
   check(
-    'A6 归属优先级：活 agent 的 options.stageKey 也能识别阶段（label 无前缀照样计数）',
-    warmBlocked.ok === false && (warmBlocked.message ?? '').includes('warm-impl-1'),
+    'A6 归属优先级：活 agent 的 options.stageKey 也能识别阶段（运行中的它照样计数）',
+    warmBlocked.ok === false && /stage concurrency limit reached/i.test(warmBlocked.message ?? ''),
     JSON.stringify(warmBlocked).slice(0, 220),
   );
   check('A6 stageKey 归属路径同样没有调用宿主创建入口', warm.calls.start === 0, 'start ' + warm.calls.start);
@@ -999,16 +973,16 @@ const attemptFollowup = async (harness, child, message, compact) => {
     JSON.stringify(stageKeys.map((key) => (stages[key]?.available ?? []).map((row) => row.label).slice(0, 3))),
   );
   check(
-    'D15 三条阶段描述都写明创建上限 + compact 对已 settle 子代理不可用 + pipeline_followup',
+    'D15 三条阶段描述都写明「没有创建总量上限、新工作流派新孩子」',
     stageKeys.every((key) => {
       const text = String(h.tools.get('subagent_' + key)?.description ?? '');
-      return text.includes('CREATION CAP') && text.includes('compact: true cannot be applied to a settled (cold) child') && text.includes('pipeline_followup');
+      return text.includes('CONCURRENCY:') && text.includes('NO cap on how many children may be CREATED in total') && text.includes('pipeline_followup');
     }),
-    JSON.stringify(stageKeys.map((key) => String(h.tools.get('subagent_' + key)?.description ?? '').includes('CREATION CAP'))),
+    JSON.stringify(stageKeys.map((key) => String(h.tools.get('subagent_' + key)?.description ?? '').includes('CONCURRENCY:'))),
   );
   check(
-    'D15 三条阶段描述都说明「settle 不腾创建名额」',
-    stageKeys.every((key) => String(h.tools.get('subagent_' + key)?.description ?? '').includes('does NOT free a creation slot')),
+    'D15 三条阶段描述都不再出现创建闸门措辞',
+    stageKeys.every((key) => !String(h.tools.get('subagent_' + key)?.description ?? '').includes('CREATION CAP')),
   );
 }
 
@@ -1386,8 +1360,8 @@ const attemptFollowup = async (harness, child, message, compact) => {
 // ════════════════════════════════════════════════════════════════════════════
 // P1–P6：重启后寻址 / label 阶段前缀 / 枚举瞬时失败 / status N+1 / 运行上限文案
 // ════════════════════════════════════════════════════════════════════════════
-// 与前面所有场景同样按 parentId 隔离（模块级台账 + createdObservation 高水位都是
-// 按父会话分键的），每个 harness 实例各自持有一份可控的宿主持久面（harness.host）。
+// 与前面所有场景同样按 parentId 隔离（模块级账本按父会话分键），每个 harness 实例
+// 各自持有一份可控的宿主持久面（harness.host）。
 
 const capFor = (caps) => ({
   plan: { budgetMinutes: 0, ...(caps.plan === undefined ? {} : { maxConcurrency: caps.plan }) },
@@ -1401,42 +1375,21 @@ const statusOfHarness = async (harness) => {
   await harness.routes.get('/dsh-code-pipeline/status')({}, res);
   return JSON.parse(captured.body).stages;
 };
-/** 从「创建上限拒绝」文案里抽出可复用清单的 id（走文案而不是硬编码常量）。 */
-const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^"]*"\s+\[(?:running|inactive)\]/g)].map((match) => match[1]);
 
-// ── F1. 无阶段归属的旧子代理（0.2.0 之前创建：label 无 `<stage>/` 前缀、非 live、台账空）──
-// 修前 `mergeStageRows` 只在 `row.stage !== undefined` 时才比较阶段，于是归属 undefined 的行会
-// **漏进每一个阶段桶**：用户实测 10 个旧子代理把 plan 桶顶到 limit 之上（他只创建过 1 个规划
-// 子代理就被拒），同时它们又进不了可复用清单（`resolveFollowupTarget` 只认有归属的行）
-// ⇒ 既不能复用也不能新建 = 阶段卡死。修复后它们必须被**排除在所有阶段桶之外**。
+
+// ── F1. 无阶段归属的旧子代理绝不参与任何阶段的并发计数 ────────────────────────
 {
   const f1 = await newHarness('parent-f1', capFor({ plan: 1, impl: 1, review: 1 }));
   f1.host.rows = persistRows([
-    ['legacy-1', 'W1 infra scaffold'],
-    ['legacy-2', 'review A'],
-    ['legacy-3', 'plan frontend scaffold'],
+    ['legacy-1', 'W1 infra scaffold', 'running'],
+    ['legacy-2', 'review A', 'running'],
+    ['legacy-3', 'plan frontend scaffold', 'running'],
   ]);
-  // 注意：不能用 status 断言——它是跨父会话的**全局聚合**，会被同进程其它 harness 的子代理污染。
-  // 这里用行为式断言，天然按父会话隔离。
   const allowed = await attempt(f1, 'subagent_impl', { description: 'fresh work beside the legacy children' });
   check(
-    'F1 无归属的旧子代理不计入创建数：cap=1 仍能新派第一个（修前会被这 3 行误判成「已创建 3」而拒）',
+    'F1 无归属的旧子代理不计入任何阶段运行数：cap=1 仍能新派',
     allowed.ok === true,
     JSON.stringify(allowed).slice(0, 260),
-  );
-  // 必须先让第 1 个结束（同 A3）：否则拦下第 2 次派发的是**运行**闸门——它和第 1 个
-  // 是否被「创建」计数毫无关系，断言就失去了对"计数是 1 而不是 1+3"的鉴别力（停掉创建
-  // 计数台账它照样绿）。结束之后运行闸门放行，撞上的才是**创建**闸门，而它的文案自带
-  // 可复用清单，能同时钉住"这个真实子代理确实被计数"。
-  const firstId = allowed.result?.subagentId;
-  f1.emit('subagent/end', { id: firstId });
-  const second = await attempt(f1, 'subagent_impl', { description: 'second impl for the same parent' });
-  check(
-    'F1 但真实创建仍被计数：第 1 个结束后第 2 个 impl 仍被创建闸门拒绝（证明计数是 1 而不是 1+3）',
-    second.ok === false
-      && /stage CREATION limit reached/i.test(second.message ?? '')
-      && (second.message ?? '').includes(String(firstId)),
-    JSON.stringify(second).slice(0, 260),
   );
   const noAddr = await attemptFollowup(f1, 'legacy-1', 'continue the legacy child');
   check(
@@ -1446,22 +1399,19 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   );
 }
 
-// ── P1. 重启后寻址：上限看得见 + 寻址也看得见（修前：不能复用也不能新建 = 阶段卡死）──
+// ── P1. 重启后：持久面的运行行参与并发计数 + 精确 id 仍可寻址 ──────────────────
 {
   const p1 = await newHarness('parent-p1', capFor({ impl: 1 }));
-  p1.host.rows = persistRows([['persisted-impl-1', 'impl/pre-restart work']]);
+  p1.host.rows = persistRows([['persisted-impl-1', 'impl/pre-restart work', 'running']]);
   const blocked = await attempt(p1, 'subagent_impl', { description: 'new work after restart' });
   check(
-    'P1 重启后创建上限仍生效（空台账 + 持久面已有 1 个 impl → 新派发被拒）',
-    blocked.ok === false && /stage CREATION limit reached/i.test(blocked.message ?? ''),
+    'P1 重启后运行上限仍生效（空台账 + 持久面已有 1 个 impl 在跑 → 新派发被拒）',
+    blocked.ok === false && /stage concurrency limit reached/i.test(blocked.message ?? ''),
     JSON.stringify(blocked).slice(0, 240),
   );
   check('P1 被拒时没有发生创建（宿主创建入口 0 次）', p1.calls.start === 0, 'start ' + p1.calls.start);
-  const listed = listedIds(blocked.message);
-  check('P1 拒绝文案给出的可复用 id 就是持久面那一行', listed.includes('persisted-impl-1'), JSON.stringify(listed));
-  // 端到端一环：把拒绝文案里给出的 id 原样拿去做 followup —— 修前这里报 no stage subagent matches。
-  const recovered = await attemptFollowup(p1, listed[0], 'continue the pre-restart work');
-  check('P1 用拒绝文案里的 id 复用成功（修前：no match → 既不能复用也不能新建 = 卡死）',
+  const recovered = await attemptFollowup(p1, 'persisted-impl-1', 'continue the pre-restart work');
+  check('P1 精确 id 复用成功（重启后台账为空也能从持久面恢复寻址）',
     recovered.ok === true, JSON.stringify(recovered).slice(0, 260));
   check(
     'P1 消息真的投递到了那个持久面子代理（投递实参 = 该 id）',
@@ -1538,14 +1488,13 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
     durableLabel === 'impl/plan/auth refactor',
     String(durableLabel),
   );
-  // 「重启」harness：只有这条 durable label 的持久行（id 用持久面合成 id，不在台账里）
+  // 「重启」harness：只有这条 durable label 的运行中持久行（id 不在台账里）
   const p2r = await newHarness('parent-p2r', capFor({ impl: 1, plan: 1 }));
-  p2r.host.rows = persistRows([['persisted-p2-1', durableLabel]]);
+  p2r.host.rows = persistRows([['persisted-p2-1', durableLabel, 'running']]);
   const implBlocked = await attempt(p2r, 'subagent_impl', { description: 'impl after restart' });
   check(
-    'P2 重启后该子代理计入 impl（impl 到顶被拒，文案列出它）',
-    implBlocked.ok === false && /stage CREATION limit reached/i.test(implBlocked.message ?? '')
-      && (implBlocked.message ?? '').includes('persisted-p2-1'),
+    'P2 重启后该运行中的持久行计入 impl（impl 到运行上限被拒）',
+    implBlocked.ok === false && /stage concurrency limit reached/i.test(implBlocked.message ?? ''),
     JSON.stringify(implBlocked).slice(0, 260),
   );
   const planOk = await attempt(p2r, 'subagent_plan', { description: 'plan after restart' });
@@ -1558,101 +1507,59 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   );
 }
 
-// ── P3. 枚举瞬时失败：不得按「持久面为空」放行；区分瞬时失败与宿主没有该能力 ─────────
+// ── P3. 枚举失败/缺失：运行闸门退回本插件账本，绝不卡死或误放行 ─────────────────
 {
-  // P3.1 枚举抛错 + 空台账 + limit=1 → 必须被拒
+  // P3.1 枚举抛错 + 空账本 → 按 0 放行（不再有创建闸门的「无法核实」保守拒绝）
   const p3 = await newHarness('parent-p3', capFor({ impl: 1 }));
   p3.host.fail = true;
-  const unverifiable = await attempt(p3, 'subagent_impl', { description: 'enumeration failing' });
+  const firstWhileFailing = await attempt(p3, 'subagent_impl', { description: 'enumeration failing' });
   check(
-    'P3 枚举瞬时抛错 + 空台账 + limit=1 → 派发被拒（不得整体旁路创建上限）',
-    unverifiable.ok === false && /CANNOT BE VERIFIED/.test(unverifiable.message ?? ''),
-    JSON.stringify(unverifiable).slice(0, 280),
+    'P3 枚举抛错 + 空账本 + limit=1 → 按账本判定放行',
+    firstWhileFailing.ok === true && p3.calls.start === 1,
+    JSON.stringify(firstWhileFailing).slice(0, 260) + ' start ' + p3.calls.start,
   );
+  const secondWhileFailing = await attempt(p3, 'subagent_impl', { description: 'second while failing' });
   check(
-    'P3 该文案声明是瞬时失败 / 可重试，且不带 UNAVAILABLE 指引横幅',
-    (unverifiable.message ?? '').includes('TRANSIENT')
-      && (unverifiable.message ?? '').includes('Retry this dispatch in a LATER step')
-      && !(unverifiable.message ?? '').includes('Pipeline stage UNAVAILABLE')
-      && !(unverifiable.message ?? '').includes('STOP and report to the user'),
-    (unverifiable.message ?? '').slice(0, 240),
+    'P3 枚举抛错但账本有 1 个在跑 → 第 2 个仍被运行上限拦住（读不到不等于没有）',
+    secondWhileFailing.ok === false && /stage concurrency limit reached/i.test(secondWhileFailing.message ?? ''),
+    JSON.stringify(secondWhileFailing).slice(0, 260),
   );
-  check('P3 被拒时没有发生创建', p3.calls.start === 0, 'start ' + p3.calls.start);
-  // P3.2 枚举恢复 → 重试成功（拒绝是瞬时的，不是永久卡死）
   p3.host.fail = false;
-  const retried = await attempt(p3, 'subagent_impl', { description: 'enumeration recovered' });
-  check(
-    'P3 枚举恢复后重试成功（瞬时拒绝，不是永久卡死）',
-    retried.ok === true && p3.calls.start === 1,
-    JSON.stringify(retried).slice(0, 220) + ' start ' + p3.calls.start,
-  );
 
-  // P3.3 高水位：成功观测一次后枚举抛错 → 仍被拒，且用那次观测的清单兜底
+  // P3.2 枚举成功时，持久面的运行行参与并发计数
   const p3b = await newHarness('parent-p3b', capFor({ impl: 1 }));
-  p3b.host.rows = persistRows([['persisted-hw-1', 'impl/high-water row']]);
-  const beforeOutage = await attempt(p3b, 'subagent_impl', { description: 'records the observation' });
+  p3b.host.rows = persistRows([['persisted-hw-1', 'impl/high-water row', 'running']]);
+  const seesDurable = await attempt(p3b, 'subagent_impl', { description: 'sees the durable row' });
   check(
-    'P3 高水位前置：先成功枚举一次并被拒（清单来自持久面）',
-    beforeOutage.ok === false && (beforeOutage.message ?? '').includes('persisted-hw-1'),
-    JSON.stringify(beforeOutage).slice(0, 220),
+    'P3 枚举成功时持久面的运行行被计入（新派发被拒）',
+    seesDurable.ok === false && /stage concurrency limit reached/i.test(seesDurable.message ?? ''),
+    JSON.stringify(seesDurable).slice(0, 220),
   );
-  const probeCallsBefore = p3b.host.calls.length;
-  p3b.host.fail = true;
-  const afterOutage = await attempt(p3b, 'subagent_impl', { description: 'enumeration now failing' });
-  check(
-    'P3 随后枚举抛错 → 仍被拒（读不到不等于没有）',
-    afterOutage.ok === false && /stage CREATION limit reached/i.test(afterOutage.message ?? ''),
-    JSON.stringify(afterOutage).slice(0, 240),
-  );
-  check(
-    'P3 拒绝文案用高水位那次观测的清单兜底（列出持久面 id + label）',
-    (afterOutage.message ?? '').includes('persisted-hw-1') && (afterOutage.message ?? '').includes('impl/high-water row'),
-    (afterOutage.message ?? '').slice(0, 240),
-  );
-  check(
-    'P3 高水位让判定在同步阶段就完成（只多一次运行闸门探测，创建闸门不再依赖持久面）',
-    p3b.host.calls.length - probeCallsBefore === 1,
-    'listing calls +' + (p3b.host.calls.length - probeCallsBefore),
-  );
-  check('P3 高水位路径同样没有创建', p3b.calls.start === 0, 'start ' + p3b.calls.start);
+  check('P3 该拒绝没有发生创建', p3b.calls.start === 0, 'start ' + p3b.calls.start);
 
-  // P3.3b 高水位已知且仍在上限内 → 枚举失败时放行（不因瞬时失败过度拒绝 / 永久卡死）
-  const p3c = await newHarness('parent-p3c', capFor({ impl: 2 }));
-  p3c.host.rows = persistRows([['persisted-hw-2', 'impl/one known child']]);
-  const knownOne = await attempt(p3c, 'subagent_impl', { description: 'records a known count of 1' });
-  check('P3 高水位已知（1）且上限 2：先成功派发一次以记录观测', knownOne.ok === true, JSON.stringify(knownOne).slice(0, 200));
-  p3c.host.fail = true;
-  const duringOutage = await attempt(p3c, 'subagent_impl', { description: 'second while listing fails' });
-  check(
-    'P3 高水位已知且仍在上限内 → 枚举失败时放行（瞬时失败不得变成永久卡死）',
-    duringOutage.ok === true && p3c.calls.start === 2,
-    JSON.stringify(duringOutage).slice(0, 240) + ' start ' + p3c.calls.start,
-  );
-
-  // P3.4 宿主根本没有 listChildren（永久形状差异，非瞬时）→ 不得被「无法核实」卡死
+  // P3.3 宿主根本没有 listChildren（永久形状差异）→ 退回台账，不卡死
   const p3d = await newHarness('parent-p3d', capFor({ impl: 1 }));
   delete p3d.subagents.listChildren;
   const noListing = await attempt(p3d, 'subagent_impl', { description: 'host has no listing' });
   check(
-    'P3 宿主没有 listChildren（永久形状差异）→ 按台账判定，不被「无法核实」卡死',
+    'P3 宿主没有 listChildren（永久形状差异）→ 按台账判定，不被卡死',
     noListing.ok === true,
     JSON.stringify(noListing).slice(0, 240),
   );
   const noListingSecond = await attempt(p3d, 'subagent_impl', { description: 'second with no listing' });
   check(
-    'P3 没有 listChildren 时台账仍是权威：第 2 个被拒（不得因为读不到就放行）',
-    noListingSecond.ok === false && /stage (concurrency|CREATION) limit reached/i.test(noListingSecond.message ?? ''),
+    'P3 没有 listChildren 时台账仍是权威：第 2 个被运行上限拒绝',
+    noListingSecond.ok === false && /stage concurrency limit reached/i.test(noListingSecond.message ?? ''),
     JSON.stringify(noListingSecond).slice(0, 260),
   );
   p3d.emit('subagent/end', { id: noListing.result.subagentId });
   p3d.children.set(noListing.result.subagentId, { activity: 'idle' });
   const noListingThird = await attempt(p3d, 'subagent_impl', { description: 'third with no listing' });
   check(
-    'P3 没有 listChildren 时创建上限也按台账生效（settle、running 归零后仍被拒）',
-    noListingThird.ok === false && /stage CREATION limit reached/i.test(noListingThird.message ?? ''),
-    JSON.stringify(noListingThird).slice(0, 260),
+    'P3 没有 listChildren 时运行名额释放后第 3 个成功（没有创建总量闸门）',
+    noListingThird.ok === true && p3d.calls.start === 2,
+    JSON.stringify(noListingThird).slice(0, 260) + ' start ' + p3d.calls.start,
   );
-  check('P3 没有 listChildren 的两次拒绝都没有发生创建', p3d.calls.start === 1, 'start ' + p3d.calls.start);
 }
 
 // ── P4. status 不再对全部 root 做 N+1：只扫组合了本预设的 root ──────────────────
@@ -2009,37 +1916,28 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   check('K2 files "-" → 允许，且子代理收到「自己做侦察」指令', declaredNone.ok === true && kPrompt.includes('NO candidate list'), JSON.stringify({ ok: declaredNone.ok, snippet: kPrompt.slice(0, 130) }));
 }
 
-// ── M. plan 的并行预算：派发时告诉规划者本会话还能创建几个实现者 ─────────────
+// ── M. 0.4.0：plan 不再携带并行预算（新工作流一律新派，plan 不必迁就并发上限）──
 {
   const { readFileSync } = await import('node:fs');
   const promptOf = (harness) => {
     let text = String(harness.calls.startPrompts.at(-1) ?? '');
-    if (!text.includes('parallelismBudget')) {
+    if (!text.includes('**files**')) {
       const m = text.match(/written to temp file: (\S+)/);
       if (m) { try { text = readFileSync(m[1], 'utf8'); } catch {} }
     }
     return text;
   };
-  const sliceFrom = (text, marker, span) => { const at = text.indexOf(marker); return at === -1 ? text.slice(0, span) : text.slice(at, at + span); };
-  const capped = await newHarness('plan-budget-capped', capStages(2));
-  await attempt(capped, 'subagent_plan', { description: 'budget 2' });
-  const cappedPrompt = promptOf(capped);
+  const planner = await newHarness('plan-no-budget', capStages(2));
+  await attempt(planner, 'subagent_plan', { description: 'no budget' });
+  const planPrompt = promptOf(planner);
   check(
-    'M1 impl 上限 2 → plan 派发带上 parallelismBudget，且要求 ≤ 2 个工作流',
-    cappedPrompt.includes('**parallelismBudget**') && cappedPrompt.includes('AT MOST 2 workstream(s)'),
-    sliceFrom(cappedPrompt, '**parallelismBudget**', 260),
+    'M1 plan 派发不再携带 parallelismBudget（仍带 files 清单指令）',
+    !planPrompt.includes('parallelismBudget') && planPrompt.includes('**files**'),
+    planPrompt.slice(0, 220),
   );
-  const one = await newHarness('plan-budget-one', capStages(1));
-  await attempt(one, 'subagent_plan', { description: 'budget 1' });
-  const onePrompt = promptOf(one);
-  check('M2 预算 1 → 要求排成单一串行序列（不是并行工作流）', onePrompt.includes('The budget is 1') && onePrompt.includes('single SERIAL sequence'), sliceFrom(onePrompt, '**parallelismBudget**', 300));
-  const unlimited = await newHarness('plan-budget-unlimited', capStages(0));
-  await attempt(unlimited, 'subagent_plan', { description: 'budget 0' });
-  const unlimitedPrompt = promptOf(unlimited);
-  check('M3 上限 0（不限制）→ 说明无插件侧上限，仍提示宿主存活上限', unlimitedPrompt.includes('No plugin-side creation limit is configured') && unlimitedPrompt.includes('default 8'), sliceFrom(unlimitedPrompt, '**parallelismBudget**', 200));
-  const implOnly = await newHarness('plan-budget-impl', capStages(2));
-  await attempt(implOnly, 'subagent_impl', { description: 'no budget block' });
-  check('M4 预算块只给 plan（impl 派发里没有 parallelismBudget）', !promptOf(implOnly).includes('parallelismBudget'), promptOf(implOnly).slice(0, 160));
+  const implementer = await newHarness('impl-no-budget', capStages(1));
+  await attempt(implementer, 'subagent_impl', { description: 'no budget' });
+  check('M2 impl 派发也没有 parallelismBudget', !promptOf(implementer).includes('parallelismBudget'), promptOf(implementer).slice(0, 160));
 }
 
 check(

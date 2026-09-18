@@ -19,7 +19,7 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 - **设置页（浏览器）**：Settings → 代码流水线，每阶段配置 `enabled` /
   `provider` / `model` / `reasoningEffort` / `maxConcurrency`，provider/模型列表来自
   `GET /dsh-code-pipeline/options`（不可用时相应字段禁用并提示，不允许手输）；
-  每阶段卡片还显示「当前运行 N / 上限 M / 已创建 K」与可复用子代理清单，数据来自
+  每阶段卡片还显示「当前运行 N / 上限 M / 已创建 K」与已创建子代理清单，数据来自
   `GET /dsh-code-pipeline/status`（每 5 秒轮询）。
 
 ## 角色边界（硬约束）
@@ -34,12 +34,11 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   「STOP and report to the user」指令,预设 persona 的 invariants 也硬性规定
   主代理**不得自己接手任务**（不代做实现/规划/审查、不换路由、不找替身),
   而是告知用户原因并等待决定。
-  **例外（不算阶段不可用，不得终止任务）**：插件自己的三道**策略闸门**与宿主的
-  「同时存活子代理」容量上限——运行并发超限、创建总量超限、创建数暂时无法核实、
-  宿主 `ACTIVATION_LIMIT_REACHED` / `subagent/delivery-unavailable`（dsh
-  0.1.6-alpha.2 起）。这些是**瞬时**拒绝，阶段本身健康；错误文案会明确写
-  「NOT stage unavailability」并给出复用 / 等待后重试的出路（见
-  「每阶段并发上限与并行派发」）。
+  **例外（不算阶段不可用，不得终止任务）**：插件自己的**运行并发闸门**与宿主的
+  「同时存活子代理」容量上限——运行并发超限、宿主 `ACTIVATION_LIMIT_REACHED` /
+  `subagent/delivery-unavailable`（dsh 0.1.6-alpha.2 起）。这些是**瞬时**拒绝，阶段本身
+  健康；错误文案会明确写「NOT stage unavailability」并给出「等名额释放后在后续步骤重试/派发
+  新子代理」的出路（见「每阶段并发上限与并行派发」）。
 
 ## 中途改需求：pipeline_followup（插入，不排队）
 
@@ -65,7 +64,7 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   无法压缩，**唤醒也救不了**——子代理答完就回到冷态：两条宿主约束结构性互斥（压缩需要**活着的**
   agent，而活着的 agent 要么正在回合中（`compactNow` 抛 `busy`），要么刚被一次投递冷唤醒、inbox
   已经满了）。实测本安装 16 次压缩（11 次手动 `/compact` + 5 次自动）**没有一次属于阶段子代理**，
-  所以复用时 `compact: true` 不可用：**接受干扰，或——仅当本会话仍有创建名额——改派新子代理，并说明选了哪一个**；
+  所以复用时 `compact: true` 不可用：**同一工作流的真正续轮就接受干扰；如果是新的独立工作流，直接给它派发新子代理（0.4.0 起没有创建名额上限），并说明选了哪一个**；
 - 行为：调用宿主原生 `subagents.sendMessage`（alpha.4 语义 = **steer/插入**）——
   运行中的子代理在**下一个模型步骤**就看到该消息（不排进队列等当前回合结束）；
   子代理已空闲/已结束时会唤醒开新回合处理；
@@ -82,13 +81,12 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
 多轮评审（plan → impl ↔ review 里的 review 轮次）不再每轮新开一个评审子代理：**第一轮
 之后的所有轮次通过已有的 `pipeline_followup` 续用第一轮那个评审子代理**。
 
-这是「**同一任务只创建一次**」这条统一协议在评审阶段的具体形态：0.2.0 起预设新增了同级小节
-「Reuse the stage subagents you already have (SAME child, later rounds)」，把
-**plan / impl / review 三阶段**都写进同一条协议（第一次用阶段工具派发，之后每一轮都用
-`pipeline_followup` 发给已有的那个子代理；出现干扰时也不能靠压缩消掉——`compact: true` 对已 settle 的子代理不可用，只能接受干扰、或在本会话仍有创建名额时另派），
-插件层再用「每 (父会话 × 阶段) 已创建数硬上限」把它变成机制（见
-「每阶段并发上限与并行派发」），并给 `pipeline_followup` 加了 `compact` 参数——
-**没有新增任何设置项**（复用既有 `maxConcurrency`）。
+这是「**同一任务只创建一次**」这条统一协议在评审阶段的具体形态：预设的
+「Reuse the stage subagents you already have (SAME child, later rounds)」把
+**plan / impl / review 三阶段**都写进同一条协议（同一 workstream/任务第一次用阶段工具派发，之后每一轮都用
+`pipeline_followup` 发给已有的那个子代理；而一个**新的独立 workstream/任务**一律新派自己的子代理——
+0.4.0 起没有创建总量上限，只有「同时运行数」上限会让新派发等一个名额）。
+**没有新增任何设置项**（复用既有 `maxConcurrency`，现在它是纯运行并发上限）。
 
 - **为什么**：子代理从空会话起步——每轮新开 `subagent_review` 都要重新吃一遍「计划 +
   完整 diff + 历史结论」，而且新会话没有前缀缓存可命中；续用同一个子代理时，这些都在它的
@@ -108,8 +106,7 @@ DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线�
   - 多个独立目标并行评审时，每个目标一个评审子代理，按各自的 `subagentId` 续用；
   - `pipeline_followup` 报「没有匹配的阶段子代理」时（例如 dsh 重启后插件进程内的派发台账
     被清空），退回一次带完整物料（含计划）的 `subagent_review` 即可——这是**回退**，不是
-    「阶段不可用」，不要因此终止任务；但若该阶段**已达创建上限**（见下节），这次回退同样会被
-    拒绝——此时按超限文案给出的清单复用，或把上限与清单报告给用户；
+    「阶段不可用」，不要因此终止任务；但若该阶段**已达运行上限**（见下节），这次回退也要等一个名额释放——此时先等完成通知、或在后续步骤重试；
   - 宿主侧依据：`pipeline_followup` 走 `subagents.sendMessage`，空闲/已 settle 的子代理会被
     唤醒成新一轮（宿主 `steer` 语义：idle driver starts a turn；`queue` 模式同理排一个新回合），
     且再次 settle 时父会话照常收到完成通知。
@@ -268,9 +265,9 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
 > 已保存过阶段配置的会话不受影响：`settings.yaml` 的 `code-pipeline.stages` 里显式
 > 写下的 provider/model 始终优先于这里的默认值。
 
-> **并发上限默认 `0` 的语义在 0.2.0 保持不变**（= 不限制，零回归）。要**强制复用**、让同一
-> (父会话 × 阶段) 到点后只能续用已有子代理，请把该阶段的「最大并发子代理数（含已创建）」
-> 设为 `≥ 1`；该数值同时管两件事：同时运行数 + 已创建（含已结束）总量。
+> **0.4.0 起 `maxConcurrency` 只表示「同时运行」的并发上限**（默认 `0` = 不限制，零回归）。
+> 旧版本那个「同一 (父会话 × 阶段) 已创建（含已结束）总量」闸门已**移除**：新工作流一律派发
+> 自己的新子代理；只有同一工作流的后续轮次才用 `pipeline_followup` 续用。
 
 > 无 fallback 孪生工具:阶段 provider/凭据/启动失败时直接报错并报告,不自动换路由。
 
@@ -289,66 +286,51 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
 
 ## 每阶段并发上限与并行派发
 
-- **设置项**：Settings → 代码流水线 → 每个阶段卡片的「最大并发子代理数（含已创建）」。
-  同一个数值是**双层上限**，两道闸门都按 `(父会话 × 阶段)` 计数：
-  1. **运行上限**：同一父会话内该阶段**同时运行**（宿主 `activity = running`）的子代理数；
-  2. **创建上限**：该阶段**已经创建过**的子代理总数——含已结束（settle / 被墙钟硬停 /
-     `lost`）的；同一 workstream 的多轮复用**不**占新名额（复用不创建）。
-  `0` = 不限制（默认，零回归）。
-- **plan 派发时会被告知这份预算**（0.3.9）：`subagent_plan` 的派发消息里多一段
-  **`parallelismBudget`**——本会话该 impl 上限 / 已创建 / 剩余可创建，并**要求**
-  `## Workstreams` 表最多只有「剩余」个工作流：超出就**合并**并排出显式**串行顺序**
-  （谁先跑、谁等谁、后者继承什么）；剩余 = 1 时要求排成单一串行序列，剩余 = 0 时要求
-  说明只能追加到已有实现者。根因：plan 切 5 个工作流而上限是 2，后 3 个只能被塞进已做过
-  别的 workstream 的冷 child（无法压缩），实测那一轮 **63 步 / 9.7M tokens**。这个数字是
-  **提示**（取自本进程台账 ∪ 最近一次成功观测的高水位，不做 I/O）：dsh 重启后台账为空时
-  可能低估已创建数，真正的准入仍由派发时的两道闸门判定。
-- **两道闸门共用一个值，且运行闸门先判**：一次派发先过运行闸门、再过创建闸门。所以上限
-  较小时，**第 1 个子代理还在跑**时紧跟着的第 2 次派发会先撞**运行上限**（这条错误文案只带
-  一句「复用永远可用」的提醒，不带清单）；等它**结束之后**再派才撞**创建上限**（这条文案才
-  带可复用子代理清单与「复用 / 接受干扰（`compact: true` 对已 settle 的子代理不可用）」指引）。撞哪一道都**不是**阶段不可用。
-- **创建上限"只增不减"**：等一个子代理 settle **不会**腾出创建名额（上限数的是「创建」，
-  不是「在跑」）；本会话内到顶后，除**复用**（`pipeline_followup`，**不带 `compact`** 地投递、接受干扰）外不再放行新的派发。这是刻意的选择——否则「创建了但宿主
-  暂时枚举不到」就成了穿透窗口，上限形同虚设。
-- **创建数的真值** = 本进程台账（已创建过的，永不移除）∪ 宿主
-  `subagents.listChildren(parent.id)` 的当前可见行；阶段归属按优先级判定：台账记录 →
-  活子代理的 `options.stageKey` → label 的 `<stage>/` 前缀（0.2.0 起阶段工具自动给
-  `description` 加该前缀，所以宿主持久面上的 label 也是阶段标记）。创建闸门同样先做**同步
-  预判**（台账 + 正在创建中的预留），`await listChildren` 之后再用**重算后的并集计数**复检，
-  抛错时归还预留——并发派发时不会互相算漏。
-- **超限拒绝自带出路**：错误里列出该阶段**可复用子代理**（`id` + label + 活跃状态），并给
-  三条出路：① `pipeline_followup` 复用其中一个；② 有干扰时也无法压缩消掉（`compact: true` 对已 settle 的子代理不可用），只能接受干扰、或在本会话仍有创建名额时另派一个；
-  ③ 全都在跑时等它的完成通知后再复用。文案明确写着「这是对**创建**的策略上限，不是阶段
-  不可用」——主代理**不得**按 UNAVAILABLE 规则终止任务。
+- **设置项**：Settings → 代码流水线 → 每个阶段卡片的「最大并发子代理数（同时运行）」。
+  口径是**运行上限**：按 `(父会话 × 阶段)` 统计该阶段**同时运行**（宿主 `activity = running`）
+  的子代理数。`0` = 不限制（默认）。
+- **没有「已创建总量」上限（0.4.0 移除）**：一个**新的独立工作流**永远可以派发自己的新子代理，
+  不论这个阶段之前创建过多少个。旧版本用创建总量闸门强制「复用优先」，代价是把新工作流硬塞给
+  一个已经做过别的 workstream 的冷子代理（无法压缩，每步重发整段历史）：实测一轮 **63 步 /
+  9.7M tokens**、每步重发约 152k，还只能靠一句「忽略之前的内容」在 prompt 里硬压——上下文删不掉。
+  现在改由「新工作流派新孩子」这条协议承担：`impl` 的**同一条工作流**后续轮次（评审问题、改需求、
+  墙钟续跑）继续用 `pipeline_followup` 回到同一个子代理；**新的独立工作流**直接用本阶段的阶段工具派发。
+- **派发被运行上限拦下怎么办**：这是**瞬时策略拒绝，不是阶段不可用**——等一个子代理结束
+  （运行名额在子代理结束时释放），然后在**后续步骤**里把剩余工作流各自派成新子代理；正在运行的
+  同一工作流孩子可以用 `pipeline_followup` 插话（不创建）。**不要**为了避开等待就把新工作流塞给
+  一个不相干的子代理。
 - **运行闸门的准入判定（两步）**：
   1. **同步先到先得**：用插件账本（运行中 + 本次启动预留）判定，超限立即拒绝；
      通过则同步占位。判定必须完全同步——PTC 的 `Promise.all` 会让同一阶段的多个
      调用同时进入 `execute`，若等 `await` 之后再判定，两个并发调用会互相把对方
      算进名额而**双双被拒**（开发时实测到这个缺陷，已修）。
   2. **异步核对**：再用宿主 `subagents.listChildren(parent.id)` 的
-     `activity === "running"` 核对真实运行数（捕获账本不知道的子代理：重启前派发
-     的、被 `pipeline_followup` 唤醒的），偏保守时可以拒绝一个刚准入的调用；同时
+     `activity === "running"` 核对真实运行数（捕获账本不知道的子代理：重启前派发的、
+     被 `pipeline_followup` 唤醒的），偏保守时可以拒绝一个刚准入的调用；同时
      用结果修剪账本里已 settle 的条目（自愈）。宿主没有 `listChildren` 或查询失败
      时退回账本，并用 live Agent 的 `status === "idle"` 修剪。
   超限时工具**拒绝**本次派发，错误信息明确标注「这是瞬时策略拒绝，不是阶段不可用」——
-  主代理应**先复用**已有子代理（`pipeline_followup`；撞创建上限那条错误还会直接给出可复用
-  清单），或给运行中的子代理插话，**不得**按 UNAVAILABLE 规则终止任务，也不要把「再派一个
-  新的子代理」当成唯一出路。
+  主代理应等名额释放后在后续步骤重派（同一工作流的后续轮次用 `pipeline_followup`），
+  **不得**按 UNAVAILABLE 规则终止任务，也不要把「复用某个不相干的子代理」当成唯一出路。
 - **动态修改**：工具每次调用都读设置，所以保存后**下一次派发**立即生效，无需重启。
   调高立即放开；**调低不会中断正在运行的子代理**，只是在新派发时按新值拦截，直到
   运行数降到新值以下。设置页每 5 秒轮询 `/dsh-code-pipeline/status` 显示
-  「当前运行 N / 上限 M / 已创建 K」与可复用子代理清单（端点缺 `created` / `available`
-  字段时优雅降级，只显示旧半句）。
+  「当前运行 N / 上限 M / 已创建 K」与已创建子代理清单（`created` / `available` 是**信息**
+  字段，端点缺失时优雅降级）。
+- **运行数的阶段归属** = 宿主 `subagents.listChildren(parent.id)` 的当前可见行；归属按优先级判定：
+  本进程台账 → 活子代理的 `options.stageKey` → label 的 `<stage>/` 前缀（0.2.0 起阶段工具自动给
+  `description` 加该前缀，所以宿主持久面上的 label 也是阶段标记）。**重启后**，只靠持久面的
+  label 前缀 / live `stageKey` 也能把在跑的子代理计入正确阶段（0.4.0 起运行闸门用同一条归属路径，
+  不再只看本进程台账）。
 - **边界**：宿主每个 `run_code` 程序仍有 `maxParallelSubCalls`（默认 10）的并行
   子调用上限，所以设 20 也不会在一个程序里真正并行超过 10 个；`ralph` 派发的子
-  代理不经过阶段工具，不受此限；创建数的计数是「本进程台账 ∪ 宿主当前可见行」，dsh 重启后
-  由宿主接手——但**本轮之前**创建、既没有 `<stage>/` label 前缀也没有 `stageKey` 的旧
-  子代理无法回溯归属：它们既不计入创建数、也不进复用清单。
+  代理不经过阶段工具，不受此限；既没有 `<stage>/` label 前缀也没有 `stageKey` 的旧子代理
+  无法回溯归属：它们不计入任何阶段的运行数、也不进已创建清单。
 - **宿主还有一层「同时存活」容量上限（dsh 0.1.6-alpha.2 起）**：宿主为每个会话（root）
   维护一个共享的 continuable 子代理名额池，大小 = `subagent.maxActiveSubagents`（**默认 8**，
-  可在 Settings → 内置插件 → 子代理 调大）。它与本插件的两道闸门**互相独立**：
+  可在 Settings → 内置插件 → 子代理 调大）。它与本插件的运行闸门**互相独立**：
   - 它数的是**同时存活**的子代理（跨阶段、跨本插件，含其它来源的子代理），
-    **子代理结束即释放**——这一点与「已创建总量」正好相反；
+    **子代理结束即释放**；
   - 名额用尽时派发会被宿主拒绝（`ACTIVATION_LIMIT_REACHED`），错误文案由插件改写成
     「宿主容量耗尽」的**瞬时**拒绝（不是阶段不可用）：主代理应等待/复用，而不是终止任务；
   - 唤醒一个已 settle 的冷子代理（`pipeline_followup`）同样需要名额；给**仍在运行**的子代理
@@ -356,12 +338,12 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   结论：`maxConcurrency: 0`（不限制）只解除了**本插件**的限制，实际并行度仍受
   `maxActiveSubagents`（默认 8）与 `run_code` 的 `maxParallelSubCalls`（默认 10）约束。
   `/dsh-code-pipeline/status` 会返回 `hostActiveSubagentLimit` 字段（宿主未注册该命名空间时不返回）。
-- **预设侧的并行立场（0.3.0 起反转）+ 「每个独立工作流至多创建一次」**：`code-pipeline` 预设的
+- **预设侧的并行立场（0.3.0 起反转）+ 「新工作流派新孩子」**：`code-pipeline` 预设的
   pipeline protocol 现在是**写入串行为默认**、并行只用于「读 / 分析 / 评审」，并行 impl 必须同时满足
   「文件不重叠 + 真正独立 + 各自可机器校验 + T2 规模」（研究：并行写手各自做隐式决策，结果会冲突，
-  且智能体数量增加收益递减）；超限拒绝是瞬时的、不是阶段失败；（0.2.0 起）**每个独立 workstream 至多创建一次**：
-  第一轮用 `subagent_impl`，之后（评审问题、改需求、墙钟续跑）一律用 `pipeline_followup`
-  回到那个子代理；并行的创建数受该阶段**创建上限**约束，超出上限时改为复用（不带 `compact` 地投递、接受干扰），而不是继续创建。
+  且智能体数量增加收益递减）；运行上限拒绝是瞬时的、不是阶段失败；**同一工作流**的后续轮次一律用
+  `pipeline_followup` 回到那个子代理，而**新的独立工作流**一律新派自己的子代理——运行名额不够时
+  等一个释放、在后续步骤重派，绝不把新工作流塞给不相干的 child。
 
 ## 每阶段墙钟预算（超时自动中断 + 收尾报告）
 
@@ -451,7 +433,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 217 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 197 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -476,13 +458,12 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 **宿主改写文案时仍能回退**（`message` 不再以 `invalid payload for subagent.prompt` 开头、
 但 `details.issues` 仍在 → OR 兜底照常继续探测并成功投递）。
 
-0.2.0 起断言数 36 → **141**（新增 105 项），分四类：
-**A. 创建数量硬闸门**——`cap=1` 时第 1 个派发成功、第 2 个（第 1 个仍在跑）被**运行上限**拦下、
-子代理结束、running 归零后第 3 个仍被**创建上限**拦下（数的是「已创建」而不是「在跑」）、
-三种被拒路径下宿主创建入口 `startContinuable` 始终只被调用 1 次（证明是代码拦下的）、
-创建上限文案带可复用清单（id + label + 活动状态）与 `pipeline_followup` 出路、并说明 `compact: true` 对已 settle 的子代理不可用（改为接受干扰 / 有名额才新派）、
+0.2.0 起断言数 36 → **141**（新增 105 项；0.4.0 改写 A/D 后为 **197**），分四类：
+**A. 运行并发闸门（0.4.0 改写，原「创建数量硬闸门」）**——`cap=1` 时第 1 个派发成功、第 2 个（第 1 个仍在跑）
+被**运行上限**拦下、第 1 个结束后第 3 个**成功**（证明没有创建总量闸门）、被拒路径下宿主创建入口
+`startContinuable` 不被多余调用、运行上限文案带「新工作流派新孩子 + 同一工作流用 `pipeline_followup`」出路、
 `cap=0` 连派 3 个全部成功（零回归）、`Promise.all` 并发 3 个只放行 1 个（同步预留生效）、
-只靠宿主 `listChildren` 里带 `<stage>/` 前缀的持久行也能判定已达上限；
+持久面里运行中的行按 `<stage>/` 前缀 / live `stageKey` 归属计入并发数；
 **B. 压缩顺序与失败路径**——`compact: true` 时 `compactNow` 一定早于投递、恰好一次压缩 + 恰好一次投递、
 压缩服务走 `agentPresets.serviceFor(child, "compaction")` 且首参是目标子代理、返回「无可压区间」
 不算失败（`compacted` 不置 true、投递照常）、`busy` / `summary` 失败码一律抛错且两条投递通道
@@ -490,8 +471,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 冷子代理报错时说明结构原因（压缩要有活着的 agent，而活着的 agent 要么正在回合中、要么刚被一次投递冷唤醒）并指向「不带 `compact` 投递 + 接受干扰，或仍有名额时另派」，不承诺重试（且根本没调用 `compactNow`）；
 **C. 别名按 `seq` 稳定**——`rearmStageBudget` 改写 `entry.at` 之后 `latest` / 阶段别名仍指向
 最后派发的那个；
-**D. status 新字段与阶段描述**——`created` / `available` 的形状与内容、三条阶段 description 里的
-创建上限与 `compact` 指引。
+**D. status 字段与阶段描述**——`created` / `available` 的形状与内容、三条阶段 description 里的运行上限措辞与 `compact` 指引。
 
 ## 计划的工作流切分（Workstreams）与并行 impl
 
@@ -503,8 +483,8 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
   workstream（依赖其余）；一个 workstream 必须值得独占一个子代理（大致 >1 个文件或 >15 分钟），不要把一件
   连贯的改动静默拆成无法各自验证的碎片；每个 workstream 自带验收检查。
 - **主代理（预设 persona）**：当计划声明 ≥2 个「文件不相交且无依赖」的 workstream、**且任务属 T2**（并行写是例外而非默认）时，可以在一个程序里并行派发
-  每个独立 workstream **至多一个** `subagent_impl`（`Promise.all`，并行度受该阶段**创建上限**约束：
-  超出上限时改为用 `pipeline_followup` 复用已有子代理（不带 `compact` 地投递、接受干扰），而不是继续创建）；
+  每个独立 workstream 一个 `subagent_impl`（`Promise.all`，并行度受该阶段**运行上限**约束：
+  超出时剩余工作流在后续步骤各自新派、等名额释放，**不要**塞给不相干的已有子代理）；
   有依赖或共享文件的顺序执行，`integration` 最后跑。
   评审阶段按 workstream 各自捕获**路径受限 diff**（`git diff HEAD -- <该 workstream 的 owned paths>`）交给各自的
   `subagent_review`——并行期间同一工作区的 `git diff HEAD` 会混入别人的改动。切分不清楚或看起来不对时，
@@ -514,6 +494,13 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.4.0（新工作流一律新派：移除「已创建总量」闸门；plan 不再需要迁就并发预算）**：
+  - **根因**：创建总量闸门把「复用优先」变成强制，于是**新工作流**只能被塞进已经做过别的 workstream 的冷子代理——无法压缩，每步重发整段历史（实测 63 步 / 9.7M tokens，每步约 152k），还得靠一句「忽略之前的内容」在 prompt 里硬压，既删不掉上下文也不可靠。0.3.9 用 `plan` 侧的 `parallelismBudget` 把切分压到预算内，但那是治标：它让 plan 少切工作流，而不是让新工作流能有自己的子代理。
+  - **做法（移除创建闸门）**：三个阶段工具的 per-(父会话 × 阶段)「已创建总量」上限与 `stageCreationCapReached` / `stageCreationCapUnverifiable` / 观测高水位（`createdObservation` / `collectStageChildren` / `knownStageRows` / `mergeStageRows` / `ledgerStageChildren`）一并删除；`maxConcurrency` 现在只表示**同时运行**上限（默认 0 = 不限制）。运行闸门保留，且**持久面归属改用 `stageOfChildRow`（label 前缀 / 活 agent stageKey）**，所以重启后持久面的运行行也能计入并发数（旧实现只认本进程台账，重启即失明）。
+  - **做法（新工作流派新孩子）**：三条阶段 description、`stageConcurrencyReached` 文案、预设的 reuse / parallel-dispatch 段落全部改写——同一 workstream 的后续轮次继续 `pipeline_followup`；**新的独立工作流一律新派自己的子代理**；运行上限拦下时等名额释放后在后续步骤重派，绝不塞给不相干的 child。`pipeline_followup` 的 `compact: true` 边界（冷 child 压不了）与必填 `files` 保持不变。
+  - **做法（plan 不再被告知预算）**：删除 `stageParallelBudget` / `renderParallelismBudget` / `parallelismBudget` 块与 plan persona 的 `BUDGET FIRST`——plan 只需切出真正需要的工作流，并发由运行时上限制约。
+  - **验证**：冒烟 A1/A2/A3（运行上限=1：第 1 个成功、第 2 个被运行闸门拒、第 1 个结束后第 3 个成功=没有创建总量闸门）、A5（`Promise.all` 只放行 1 个）、A6/P1/P2（持久面运行行按 label / stageKey 归属计入并发计数）、P3（枚举失败退回账本、不卡死不放行）、M1/M2（plan/impl 派发都不带 `parallelismBudget`）。断言数 **217 → 197**、0 failure。
+  - 版本 0.3.9 → 0.4.0。**预设改动需要手动同步**（自动安装不覆盖已有预设）。
 - **0.3.9（让 plan 一开始就知道实现者的创建预算，切出可执行的串行计划）**：
   - **根因**：0.3.8 记录的 63 步那一轮，成因是 plan 切了 **5 个工作流**（A–E）而 impl 创建上限是 **2**——后 3 个只能被塞进已经做过别的 workstream 的冷 child（无法压缩），正是「跨工作流复用」最贵的形态。上个版本只在**撞上限之后**补救（写明代价 + 优先级），这个版本把预算**提前告诉规划者**。
   - **做法**：`subagent_plan` 的派发消息新增 **`parallelismBudget`** 块（`stageParallelBudget` 计算，与创建上限准入同源——本进程台账 ∪ 最近一次成功观测的高水位，不做 I/O）：写明该 impl 上限 / 已创建 / 剩余可创建，并**要求** `## Workstreams` 表最多只有「剩余」个工作流；超出时必须**合并**并排出显式**串行顺序**（谁先跑、谁等谁、后者继承什么），剩余 = 1 时要求排成单一串行序列，剩余 = 0 时要求说明只能追加到已有实现者。上限为 0（不限制）时改为提示宿主的存活上限（默认 8）。该块**只给 plan**（impl/review 派发不含）。plan persona 的 `BUDGET FIRST` 与预设的 Workstreams 段落同步。
