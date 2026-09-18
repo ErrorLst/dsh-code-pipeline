@@ -437,7 +437,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 199 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 202 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -500,6 +500,13 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.5（把「该读哪些文件」变成派发契约的 `files` 字段：主会话已侦察、plan 仍从零重读）**：
+  - **实测证据**（`zy_platform_frontend`，主会话 `session-92a50bf5` + plan 子代理 `6358a69f`）：主会话用 15 步读了 **33 个文件**再派发 plan；派发消息（8189 字符）里其实有一整节 `## 仓库现状（已替你核实，可直接采信）`，按文件+行号列出 `plugin-api/src/context.ts`、`host-services.ts`、`host-context.ts`、`config-service.ts`、`plugin-host.ts`、`host-info.ts`、`main.ts`、`App.vue`、`stores/app.ts`、`ipc-contract.ts`、`preload/index.ts`、`main/ipc.ts`、`main/window.ts`、`core-settings/*`、测试与文档……**清单是发过去了**；但 plan 仍然用了 **20 步 / 56 次 read / 48 个文件**，其中约 30 个是主会话刚读过的同一批。
+  - **三个原因**：① 清单是**散文**（路径嵌在中文叙述里），子代理要先「再解析」一遍；② 派发明写「仍建议你按需打开原文件确认细节」，persona 又写「verify by reading the actual code」——两句都在推它逐个开文件；③ 没有任何指令说「先一次性读完这份清单」。0.3.4 的读卫生提醒在这一轮**确实触发了**，20 步也没有降下来：所以问题在派发契约，不在提醒强度。
+  - **做法**：`subagent_plan` / `subagent_impl` / `subagent_review` 新增 `files` 入参（一行一个路径）。派发时它渲染成一个专门块并附硬指令——「这是 orchestrator 已核实的候选集；在你规划/审查/编辑之前，先用**一个** `run_code` 程序把下面每个路径读完（并行 `tools.read`，整文件）；不要再花步数重新推导文件清单」。plan/impl/review persona 与阶段工具 description 同步。
+  - **主代理协议**：预设 `### Step economy` 新增一条——派发阶段时把**你已经打开或列入候选的每个路径**写进它的 `files` 字段；只写在散文 `context` 里会让子代理一步步重新发现。
+  - **验证**：冒烟 J1–J3（schema 暴露 `files`、带 `files` 的派发成功、派发文本含「ONE run_code program」+ 原样路径），断言数 **199 → 202**、0 failure。
+  - 版本 0.3.4 → 0.3.5。**预设改动需要手动同步**（自动安装不覆盖已有预设）。
 - **0.3.4（读卫生提醒的判定重写：0.3.3 的实现在真实会话里一次都没开火）**：
   - **实测证据**：`zy_platform_frontend` 工作区的 plan 阶段子代理（session `2efd29ae-b1bc-47a7-8703-1957f1fd0381`，10:14–10:18）跑了 **33 步 / 32 个 `run_code` 程序 / 61 次嵌套 read / 46 个文件**，累计 **2,575,535 tokens**（input 133,871 + cacheRead 2,399,488 + output 42,176），而 0.3.3 的 read-hygiene 提醒一次都没出现——尽管 `settings-plugin.spec.ts` 等文件确实被重复读。
   - **为什么没开火（两处判定太窄）**：① `lastReads` 每个 agent 只存**一条**「上一次读」，而真实会话里同一文件的多次读几乎总被其它文件的读隔开（例如 `host-services.ts` 读 `1+3000`、中间隔了 5 个文件、再读 `1+2000`）——单槽位在第二次就被重置；② 要求两个窗口「重叠或首尾相接」，于是 `loader.spec.ts` 的 `100+60 → 900+60 → 1100+60` 这种**带间隔的分页**也全部逃掉。

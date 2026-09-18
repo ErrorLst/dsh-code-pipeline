@@ -61,7 +61,7 @@ function createHarness(parentId = 'parent-1') {
   // 宿主调用记账：实参形状与调用次数（宿主契约回归——漏传 signal 会让脚本变红）。
   // promptPayloads 在"判定接受之前"记录每次尝试的载荷：探测表的尝试序列因此可断言
   // （光看 queued[last] 看不出中间试过哪些形状）。
-  const calls = { prompt: 0, promptPayloads: [], promptSignals: [], startSignals: [], sendMessageOptions: [], rejectDelivery: false, rejectKnownShapes: false, rewriteBadPayloadMessage: false,
+  const calls = { prompt: 0, promptPayloads: [], promptSignals: [], startSignals: [], startPrompts: [], sendMessageOptions: [], rejectDelivery: false, rejectKnownShapes: false, rewriteBadPayloadMessage: false,
     // 创建上限 / 压缩顺序断言的记账：
     //   start          —— 宿主创建入口 startContinuable 的真实调用次数（证明闸门是代码拦的）；
     //   order          —— 跨服务统一调用序列（压缩必须早于投递）；
@@ -127,6 +127,7 @@ function createHarness(parentId = 'parent-1') {
         throw new TypeError('subagent start request carries no text prompt');
       }
       calls.startSignals.push(spec.signal);
+      calls.startPrompts.push(spec.request.prompt[0].text);
       calls.start += 1;
       calls.order.push('startContinuable');
       // 容量拒绝发生在 reserve 阶段（宿主 continuation-activation.ts:41-55），
@@ -1929,6 +1930,28 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   check('I6 整文件重读（窗口重叠）→ 提醒', rereadWhole?.additionalContexts?.length === 1, JSON.stringify(rereadWhole?.additionalContexts ?? []).slice(0, 160));
   const grep = await call('prog-9', 'grep', { pattern: 'x' });
   check('I7 非 read 工具不触发', grep?.additionalContexts === undefined, JSON.stringify(grep).slice(0, 120));
+}
+
+// ── J. files 清单：入参 schema + 派发时的「先批量读完」硬指令 ──────────────────
+{
+  const { readFileSync } = await import('node:fs');
+  const hj = await newHarness('files-plumbing', capStages(0));
+  const planDef = hj.tools.get('subagent_plan');
+  check('J1 subagent_plan 的入参 schema 暴露 files 字段', JSON.stringify(planDef).includes('"files"'), Object.keys(planDef?.input?.schema?.properties ?? {}).join(','));
+  const dispatch = await attempt(hj, 'subagent_plan', { prompt: 'Plan the change.', files: 'packages/plugin-api/src/context.ts\napps/desktop/src/shared/ipc-contract.ts' });
+  check('J2 带 files 的派发成功', dispatch.ok === true, JSON.stringify(dispatch).slice(0, 160));
+  let childPrompt = String(hj.calls.startPrompts.at(-1) ?? '');
+  if (!childPrompt.includes('**files**')) {
+    const m = childPrompt.match(/written to temp file: (\S+)/);
+    if (m) { try { childPrompt = readFileSync(m[1], 'utf8'); } catch {} }
+  }
+  check(
+    'J3 files 渲染成「一个程序先读完」硬指令 + 原样清单',
+    childPrompt.includes('ONE run_code program')
+      && childPrompt.includes('packages/plugin-api/src/context.ts')
+      && childPrompt.includes('apps/desktop/src/shared/ipc-contract.ts'),
+    childPrompt.slice(Math.max(0, childPrompt.indexOf('**files**')), childPrompt.indexOf('**files**') + 240),
+  );
 }
 
 check(
