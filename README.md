@@ -213,7 +213,7 @@ Markdown 渲染，长计划会挤压展示）：
    然后结束回合等待用户输入；
 2. 用户下一条消息即闸门答复：**批准**（approve / 批准 / 同意 / ok / 可以 / 开始 /
    没问题 等，且无新增要求）→ 进入实现阶段；**其他任何内容**视为修订反馈 → 并入计划
-   重新呈现（最多两轮修订后停止并报告）。
+   重新呈现；**修订没有次数上限**——每一轮修订都只发生在你给出新方向之后，循环由你控制，直到你批准或明确叫停。
 
 运行规则以 `preset/code-pipeline/agent.cordis.yml` 的 pipeline protocol 为准。
 
@@ -439,7 +439,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 205 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 206 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -500,6 +500,11 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.4.4（plan 人工闸门取消修订次数上限：循环由用户门控）**：
+  - **问题**：预设原写「闸门反馈最多两轮修订，之后停止并报告」。但闸门每一轮修订都必须等用户下一条消息才可能发生——它不是一个自主循环，用固定次数截断只会在用户还想继续改方向时强行停下。
+  - **做法（纯 persona 文本）**：删除 `at most two revisions, then stop and report`，改为「**没有修订次数上限**：修订轮只发生在用户给出新方向之后，循环由用户控制，直到用户批准或明确叫停」。同一任务仍只用一个 planner（`pipeline_followup` 续用，禁止对同一任务第二次 `subagent_plan`）——去掉的只是轮次上限，不是复用纪律。README「人工闸门」同步。
+  - **验证**：冒烟 E17（预设含 `There is NO revision cap` / `the loop is gated by the user`，且旧的 `at most two revisions` 已消失）。断言数 **205 → 206**、0 failure。
+  - 版本 0.4.3 → 0.4.4。
 - **0.4.3（安装 / 升级时自动同步预设：指纹不一致就自动覆盖，覆盖前留 temp 备份）**：
   - **问题**：安装/升级只更新包，`$DSH_HOME/.agent-presets/code-pipeline` 是用户资产；旧逻辑「已存在就跳过、绝不覆盖」，于是每次改预设都要手动 `cp`——0.4.2 改的 `### Step economy` 不手动同步就不生效。附带一个假告警：设置页写进预设的 `compactionThresholdRatio` 只要不等于出厂 `0.5`，`warnIfPresetDiffersFromBundle` 的整文件比较就永远报「preset 落后了」。
   - **做法**：`ensurePresetInstalled` 改为**指纹驱动**——把包内预设（`agent.cordis.yml` + `preset.yml` 等全部文件）算成一个 sha256 指纹，安装目录里的 `.dsh-bundle.json` 记录上次同步的 `{version, hash, syncedAt}`。指纹一致 → 不碰用户文件（两次升级之间的本地改动保留）；不一致（插件升级，或首次没有记录）→ 逐文件覆盖已安装副本、写回新指纹，覆盖前把旧副本备份到 `$TMPDIR/dsh-code-pipeline-preset-backup/`（与派发消息的 temp 根分开，免得被 24h 清理扫掉）。「目录在、组合文件缺」现在直接补齐，不再只告警。覆盖后设置页的压缩触发比例由既有对账器写回，无需手动重设。`warnIfPresetDiffersFromBundle` 比较前抹掉设置页写入的 `thresholdRatio`/`retainRatio`，告警只在真有本地改动时出现。

@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-code-pipeline",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "DSH bundle plugin: 为 code-pipeline 预设（PTC 流水线）动态注入阶段子代理工具（subagent_plan / subagent_impl / subagent_review），各阶段 provider/model/思考等级/最大并发数可在设置页（Settings → 代码流水线）实时配置并持久化到 settings.yaml（最大并发是**同时运行**的并发上限，按 (父会话 × 阶段) 准入；0.4.0 起已移除「已创建总量」闸门——新工作流一律派发新子代理，只有同一工作流的后续轮次用 pipeline_followup 续用；运行中可动态调整，0 = 本插件不限制，但仍受宿主每会话同时存活 continuable 子代理上限 subagent.maxActiveSubagents 约束，默认 8）；预设文件随项目在 preset/ 目录维护，首次启动自动安装到 $DSH_HOME/.agent-presets（见 README）；三阶段统一「同一工作流续用、新工作流新派」（prompt 协议：plan/impl/review 同一工作流的后续轮次都用 pipeline_followup 续用已有子代理，第 2 轮起增量投递，不新增设置项）；pipeline_followup 支持 compact=true：投递之前先压缩目标子代理自己的历史（有干扰时才用，压缩失败则什么都不投递）；每阶段可配墙钟预算（80% 软警告、到点自动中断该子代理并自动索取收尾报告，按「续 / 拆 / 停」协议处置）＋计划产出 Workstreams 切分表（独立工作流并行 impl、各自路径受限 diff 独立评审）；0.4.2 起把「run_code 程序即上下文边界（只有 PRINT/return 的内容进历史并每步重发）、只打印蒸馏结果、验证输出有界、工作流粒度有上界」写进三段 persona 与预设；0.4.3 起安装/升级时自动同步预设（比对包内预设的内容指纹，变了就覆盖已安装副本，覆盖前留 temp 备份；指纹一致则保留用户本地改动）",
   "homepage": "https://github.com/ErrorLst/dsh-code-pipeline",
   "repository": {

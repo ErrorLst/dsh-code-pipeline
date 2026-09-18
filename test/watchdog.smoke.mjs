@@ -1076,6 +1076,12 @@ const attemptFollowup = async (harness, child, message, compact) => {
       && pluginSource.includes("BOUND every check's output")
       && pluginSource.includes('Keep each workstream SMALL ENOUGH to finish in a few dozen steps'),
   );
+  check(
+    'E17 plan 修订没有次数上限（旧的「最多两轮」消失，改为用户门控）',
+    persona.includes('There is NO revision cap')
+      && persona.includes('the loop is gated by the user')
+      && !persona.includes('at most two revisions'),
+  );
   check('E6 冷子代理锚点在 persona 里（A cold child cannot be compacted）', persona.includes('A cold child cannot be compacted'));
   check(
     'E7 评审第 2 轮只送增量：新锚点在、旧的 FULL NEW diff 措辞已消失',
