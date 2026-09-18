@@ -7,7 +7,7 @@
 // 运行：node test/watchdog.smoke.mjs（或 npm test）
 // 依赖：@deepseek-ai/schemastery 必须可解析（pnpm install，或本地开发时链接宿主副本）。
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1243,12 +1243,20 @@ const attemptFollowup = async (harness, child, message, compact) => {
 {
   const originalHome = process.env.DSH_HOME;
   const installedPath = (home) => join(home, '.agent-presets', 'code-pipeline', 'agent.cordis.yml');
+  const presetHome = (home) => join(home, '.agent-presets', 'code-pipeline');
   const readIfAny = (home) => (existsSync(installedPath(home)) ? readFileSync(installedPath(home), 'utf8') : undefined);
   const bareHome = () => mkdtempSync(join(tmpdir(), 'dsh-code-pipeline-chain-'));
+  // 包内预设当前指纹：把它种成「已同步」记录后，ensurePresetInstalled 不会覆盖 fixture，
+  // 于是 G3–G5 仍能测对账器本身（否则会先被自动同步覆盖掉）。
+  const bundleDigest = await plugin.presetBundleDigest(join(root, 'preset', 'code-pipeline'));
+  const seedSync = (home, record = bundleDigest) => {
+    writeFileSync(plugin.presetSyncPath(presetHome(home)), JSON.stringify(record), 'utf8');
+  };
   const writeHome = (text) => {
     const home = bareHome();
-    mkdirSync(join(home, '.agent-presets', 'code-pipeline'), { recursive: true });
+    mkdirSync(presetHome(home), { recursive: true });
     writeFileSync(installedPath(home), text, 'utf8');
+    seedSync(home);
     return home;
   };
   // 走真实接线：apply 里的 installSection 会（同步）调用 setSource，从而触发对账写盘。
@@ -1288,17 +1296,20 @@ const attemptFollowup = async (harness, child, message, compact) => {
     );
   }
 
-  // G2 组合文件缺失：只告警，绝不创建（安装是 ensurePresetInstalled 的职责，这里它是 incomplete）。
+  // G2 组合文件缺失：0.4.3 起自动从包内补齐（安装/升级都会补齐，不再只告警）。
   {
     const home = bareHome();
-    mkdirSync(join(home, '.agent-presets', 'code-pipeline'), { recursive: true });
-    const harness = await applyAt(home, 'parent-chain-missing', { compactionThresholdRatio: 0.3 });
-    await tick(30);
+    mkdirSync(presetHome(home), { recursive: true });
+    await applyAt(home, 'parent-chain-missing', { compactionThresholdRatio: 0.3 });
+    await settle(() => (readIfAny(home) ?? '').includes('thresholdRatio: 0.3'));
+    const text = readIfAny(home) ?? '';
     check(
-      'G2 已安装组合缺失：只告警、不创建文件',
-      !existsSync(installedPath(home))
-        && harness.warnings.some((line) => line.includes('installed preset composition missing')),
-      JSON.stringify({ created: existsSync(installedPath(home)), warnings: harness.warnings.slice(-2) }),
+      'G2 已安装组合缺失：自动从包内补齐、写入同步记录，并照常对账压缩比例',
+      existsSync(installedPath(home))
+        && text.includes('agent preset')
+        && text.includes('thresholdRatio: 0.3')
+        && existsSync(plugin.presetSyncPath(presetHome(home))),
+      JSON.stringify({ created: existsSync(installedPath(home)), ratio: (text.match(/thresholdRatio: \S+/) ?? [])[0] }),
     );
   }
 
@@ -1366,6 +1377,54 @@ const attemptFollowup = async (harness, child, message, compact) => {
       parses(text)
         && text.includes("      name: '@deepseek-ai/dsh-compaction-basic'\n      config:\n        thresholdRatio: 0.3\n        retainRatio: 0.06"),
       JSON.stringify(text.slice(-140)),
+    );
+  }
+
+  // G6 包内预设变化（插件升级）→ 自动覆盖已安装副本并写回新同步记录。
+  {
+    const stale = ['# stale installed copy', '- id: persona', '  name: x', ''].join('\n');
+    const home = bareHome();
+    mkdirSync(presetHome(home), { recursive: true });
+    writeFileSync(installedPath(home), stale, 'utf8');
+    seedSync(home, { version: '0.0.1', hash: 'stale-hash' });
+    await applyAt(home, 'parent-chain-refresh', { compactionThresholdRatio: 0.3 });
+    await settle(() => (readIfAny(home) ?? '').includes('thresholdRatio: 0.3'));
+    const text = readIfAny(home) ?? '';
+    const record = JSON.parse(readFileSync(plugin.presetSyncPath(presetHome(home)), 'utf8'));
+    check(
+      'G6 同步记录与包内哈希不一致（插件升级）→ 自动覆盖为包内预设并写回新哈希',
+      !text.includes('# stale installed copy')
+        && text.includes('agent preset')
+        && record.hash === bundleDigest.hash
+        && record.version === bundleDigest.version,
+      JSON.stringify({ refreshed: !text.includes('# stale installed copy'), hashOk: record.hash === bundleDigest.hash }),
+    );
+    const backupRoot = join(tmpdir(), 'dsh-code-pipeline-preset-backup');
+    const backups = existsSync(backupRoot) ? readdirSync(backupRoot) : [];
+    const backedUp = backups.some((name) => {
+      const p = join(backupRoot, name, 'agent.cordis.yml');
+      return existsSync(p) && readFileSync(p, 'utf8').includes('# stale installed copy');
+    });
+    check(
+      'G6 覆盖前的旧副本已备份到 temp（可恢复）',
+      backedUp,
+      JSON.stringify(backups.slice(-3)),
+    );
+  }
+
+  // G7 同步记录与包内一致 → 用户本地改动保留，不被自动同步覆盖。
+  {
+    const localEdit = ['# local edit kept', '- id: persona', '  name: x', ''].join('\n');
+    const home = bareHome();
+    mkdirSync(presetHome(home), { recursive: true });
+    writeFileSync(installedPath(home), localEdit, 'utf8');
+    seedSync(home);
+    await applyAt(home, 'parent-chain-keep', { compactionThresholdRatio: 0.3 });
+    await tick(30);
+    check(
+      'G7 同步记录与包内一致 → 本地改动保留（自动同步只在包内变化时覆盖）',
+      (readIfAny(home) ?? '').includes('# local edit kept'),
+      JSON.stringify((readIfAny(home) ?? '').slice(0, 50)),
     );
   }
 

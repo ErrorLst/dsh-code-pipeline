@@ -135,8 +135,9 @@ dsh plugin --profile web add github:ErrorLst/dsh-code-pipeline
   reconcile 会读取包内 `dsh.bundle.patch` 声明，自动把
   `@dsh-external/dsh-code-pipeline` 追加进 `dsh.profile.bundles`（**无需手动登记**）。
 - 重启 `dsh web` 即挂载生效（bundle 层在启动时组合，客户端 bundle 在启动时扫描）。
-- **首次启动自动安装预设**：检测到 `$DSH_HOME/.agent-presets/code-pipeline` 缺失时，
-  插件自动从包内 `preset/code-pipeline/` 拷贝（幂等；已安装则跳过，**绝不覆盖**）。
+- **预设自动安装 / 自动同步**：`$DSH_HOME/.agent-presets/code-pipeline` 缺失时从包内
+  `preset/code-pipeline/` 拷贝；已存在时，**只要包内预设的内容变了（即插件升级）就自动覆盖**它，
+  覆盖前留一份 temp 备份。两次升级之间你对已安装副本的本地改动会被保留（见「预设文件」）。
 
 ### 方式二：本地开发安装
 
@@ -166,28 +167,28 @@ dsh plugin --profile web remove @dsh-external/dsh-code-pipeline
 禁用通用 `subagent`/`subagent_fork`、delegation 组等）**随本仓库在
 `preset/code-pipeline/` 目录维护**（`agent.cordis.yml` + `preset.yml`）。
 
-- **自动安装**：插件启动时若发现 `$DSH_HOME/.agent-presets/code-pipeline` 缺失，
-  会从包内 `preset/code-pipeline/` 自动拷贝（首次安装无需手动步骤；已存在则跳过，
-  **绝不覆盖**——升级时不会悄悄改写你的预设）。
-- **手动补装**（自动安装失败/被跳过时）：
+- **自动安装 / 自动同步（0.4.3 起）**：插件启动时若发现 `$DSH_HOME/.agent-presets/code-pipeline`
+  缺失，会从包内 `preset/code-pipeline/` 自动拷贝；若已存在，则比较安装目录里 `.dsh-bundle.json`
+  记录的「上次同步指纹」与包内预设的当前指纹（sha256，覆盖 `agent.cordis.yml` + `preset.yml` 等全部文件）：
+  - **指纹一致** → 不动用户文件（两次插件升级之间你对已安装副本的本地改动得以保留）；
+  - **指纹不一致**（插件升级，或首次没有记录）→ **自动用包内预设覆盖**已安装副本、写回新指纹，
+    并把覆盖前的副本备份到 `$TMPDIR/dsh-code-pipeline-preset-backup/<preset>-<version>-<ts>/`。
+  覆盖后设置页的「压缩触发比例」会照常对账写回，不需要手动重设。
+- **手动补装 / 手动回退**（自动同步失败，或想拿回某次覆盖前的版本时）：
 
   ```powershell
   Copy-Item -Recurse -Force "$PSScriptRoot\preset\code-pipeline" "$env:DSH_HOME\.agent-presets\code-pipeline"
   ```
 
-  （`$env:DSH_HOME` 默认 `C:\Users\<user>\.dsh`。）
-
-- **升级同步**：插件升级后若行为对不上（工具名/规则文本变化），用仓库新版本
-  **整目录覆盖** `$DSH_HOME\.agent-presets\code-pipeline`（`Copy-Item -Recurse -Force`）；
-  `diff -r` 两份目录即可先确认差异。
+  （`$env:DSH_HOME` 默认 `C:\Users\<user>\.dsh`；覆盖前的备份路径在同一条启动日志里。）
 
 - 生效时机：**新会话/新子代理**生效（dsh 的 standing 挂载按组合文件的变化时间戳
   重建）；**已经在运行的会话不会**自动切换——需要换新预设请开新会话。
 
-- 插件与预设的版本对应：插件只保证与**仓库内 preset/ 副本**一致的那一版预设协同
-  工作。升级插件后若发现行为对不上（如工具名、规则文本变化），优先检查
-  `$DSH_HOME\.agent-presets\code-pipeline` 是否落后于仓库的 `preset/code-pipeline`——
-  `diff -r` 两份目录即可确认。插件启动时若发现目标预设目录缺失，会自动安装（见上）。
+- 插件与预设的版本对应：插件保证与**仓库内 preset/ 副本**一致的那一版预设协同工作，
+  并在包内预设变化时自动同步（见上）。启动日志里若出现
+  `installed preset ... differs from the bundled copy`，说明你在已安装副本上做过的本地改动
+  与包内不同（设置页写入的压缩比例不计入这个比较）——注意：**下一次插件升级会覆盖这些改动**。
 
 ## 预设要求
 
@@ -438,7 +439,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 202 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 205 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -499,6 +500,12 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.4.3（安装 / 升级时自动同步预设：指纹不一致就自动覆盖，覆盖前留 temp 备份）**：
+  - **问题**：安装/升级只更新包，`$DSH_HOME/.agent-presets/code-pipeline` 是用户资产；旧逻辑「已存在就跳过、绝不覆盖」，于是每次改预设都要手动 `cp`——0.4.2 改的 `### Step economy` 不手动同步就不生效。附带一个假告警：设置页写进预设的 `compactionThresholdRatio` 只要不等于出厂 `0.5`，`warnIfPresetDiffersFromBundle` 的整文件比较就永远报「preset 落后了」。
+  - **做法**：`ensurePresetInstalled` 改为**指纹驱动**——把包内预设（`agent.cordis.yml` + `preset.yml` 等全部文件）算成一个 sha256 指纹，安装目录里的 `.dsh-bundle.json` 记录上次同步的 `{version, hash, syncedAt}`。指纹一致 → 不碰用户文件（两次升级之间的本地改动保留）；不一致（插件升级，或首次没有记录）→ 逐文件覆盖已安装副本、写回新指纹，覆盖前把旧副本备份到 `$TMPDIR/dsh-code-pipeline-preset-backup/`（与派发消息的 temp 根分开，免得被 24h 清理扫掉）。「目录在、组合文件缺」现在直接补齐，不再只告警。覆盖后设置页的压缩触发比例由既有对账器写回，无需手动重设。`warnIfPresetDiffersFromBundle` 比较前抹掉设置页写入的 `thresholdRatio`/`retainRatio`，告警只在真有本地改动时出现。
+  - **边界**：覆盖发生在**插件启动（apply）时**，所以装完重启 `dsh` 即生效；当前正在运行的会话仍按已挂载的组合工作（需新会话 / 新派发的阶段子代理）。想保留本地改动就不要只改已安装副本——改仓库 `preset/` 再升级。
+  - **验证**：冒烟 G2（组合缺失 → 自动补齐 + 写指纹 + 照常对账压缩比例）、G6（指纹不一致 → 自动覆盖为包内预设并写回新指纹）、G6 备份（覆盖前的旧副本落到 temp、可恢复）、G7（指纹一致 → 本地改动保留）。断言数 **202 → 205**、0 failure。
+  - 版本 0.4.2 → 0.4.3。
 - **0.4.2（上下文预算纪律：把「程序即上下文边界」写进三段 persona 与预设；工作流粒度加上界）**：
   - **根因**：实测一个 impl 子代理单轮 **62 步、`totalTokens` 13,020,339**，其中 **97% 是 cacheRead**——`usage.totalTokens = input + output + cacheRead` 按步累加，每步都把整段上下文重发一遍。按内容拆这段上下文：**模型自己的 reasoning 占 41%**、工具结果 37%、`run_code` 程序源码（工具调用实参）18%、system + 派发 3%。关键事实：`tool/ptc-dispatch` 里「程序读进来但没打印」的文件内容**根本不进上下文**，真正留在历史里的只有 **`console.log` 打印出来的东西**（实测把一份大文件的头部在两个相邻步骤里几乎原样打印了两遍、一条 38KB 的测试输出直接驻留到结束）。所以省 token 的两个杠杆是：**步数**（每步重发整段上下文，成本近似 `steps × context`）与**打印量**（每字符按剩余步数计费）。
   - **做法（协议层，不改插件逻辑）**：三段阶段 persona 的 `READ ECONOMICS` 改写为 `CONTEXT ECONOMICS`——明确「`run_code` 程序就是上下文边界：程序内部的 read / grep / 命令不花钱，只有 PRINT 或 return 的才进历史，且每步重发」，要求只打印要用的蒸馏结果、不重复打印、读-改在同一个程序里；impl persona 追加**有界验证输出**（`| tail -25` / `grep -E 'error|FAIL|Tests '`，每个逻辑块只跑一次检查）；plan persona 追加**工作流粒度上界**（把契约 + 服务 + 门禁 + 外壳 + 配置 + 文档捆进一个 workstream 会拖成 50+ 步、数百万 token，必须拆开）。预设 `### Step economy` 由「读一次、读宽」改写为「程序即上下文边界」，新增「命令输出有界」一条，`Workstreams` 段同步粒度上界。
