@@ -1562,6 +1562,36 @@ const statusOfHarness = async (harness) => {
   );
 }
 
+// ── P7. 并发上限按会话独立：两个会话各自拿同一个 limit，互不占名额 ────────────────
+{
+  const a = await newHarness('parent-p7-a', capFor({ impl: 1 }));
+  const b = await newHarness('parent-p7-b', capFor({ impl: 1 }));
+  const aFirst = await attempt(a, 'subagent_impl', { description: 'session A slot' });
+  const bFirst = await attempt(b, 'subagent_impl', { description: 'session B slot' });
+  check(
+    'P7 limit=1 时两个不同会话各自都能派发（限制不是所有会话合计）',
+    aFirst.ok === true && bFirst.ok === true && a.calls.start === 1 && b.calls.start === 1,
+    JSON.stringify([aFirst.ok, bFirst.ok, a.calls.start, b.calls.start]),
+  );
+  const aSecond = await attempt(a, 'subagent_impl', { description: 'session A second' });
+  const bSecond = await attempt(b, 'subagent_impl', { description: 'session B second' });
+  check(
+    'P7 每个会话各自到自己的 limit 才被拒（互不影响对方）',
+    aSecond.ok === false && bSecond.ok === false,
+    JSON.stringify([aSecond.ok, bSecond.ok]),
+  );
+  const stages = await statusOfHarness(a);
+  check(
+    'P7 status 的 running 是「单会话最多」而不是跨会话合计（running < totalRunning）',
+    Number.isFinite(stages.impl?.running) && stages.impl.running >= 1
+      && Number.isFinite(stages.impl?.totalRunning) && stages.impl.running < stages.impl.totalRunning
+      && stages.impl.totalRunning >= 2
+      && Number.isFinite(stages.impl?.sessions) && stages.impl.sessions >= 2
+      && stages.impl?.limit === 1,
+    JSON.stringify(stages.impl),
+  );
+}
+
 // ── P4. status 不再对全部 root 做 N+1：只扫组合了本预设的 root ──────────────────
 {
   const p4 = await newHarness('parent-p4', capFor({}));

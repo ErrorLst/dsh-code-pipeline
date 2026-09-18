@@ -289,6 +289,9 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
 - **设置项**：Settings → 代码流水线 → 每个阶段卡片的「最大并发子代理数（同时运行）」。
   口径是**运行上限**：按 `(父会话 × 阶段)` 统计该阶段**同时运行**（宿主 `activity = running`）
   的子代理数。`0` = 不限制（默认）。
+- **按会话独立**：上限由每个父会话**各自**判定——A 会话跑满该阶段不会占用 B 会话的名额；
+  账本（运行中 + 在途创建）与宿主 `listChildren(parent.id)` 核对都以父会话为键。跨会话只做
+  展示用的合计，绝不参与准入判定。
 - **没有「已创建总量」上限（0.4.0 移除）**：一个**新的独立工作流**永远可以派发自己的新子代理，
   不论这个阶段之前创建过多少个。旧版本用创建总量闸门强制「复用优先」，代价是把新工作流硬塞给
   一个已经做过别的 workstream 的冷子代理（无法压缩，每步重发整段历史）：实测一轮 **63 步 /
@@ -314,9 +317,11 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   **不得**按 UNAVAILABLE 规则终止任务，也不要把「复用某个不相干的子代理」当成唯一出路。
 - **动态修改**：工具每次调用都读设置，所以保存后**下一次派发**立即生效，无需重启。
   调高立即放开；**调低不会中断正在运行的子代理**，只是在新派发时按新值拦截，直到
-  运行数降到新值以下。设置页每 5 秒轮询 `/dsh-code-pipeline/status` 显示
-  「当前运行 N / 上限 M / 已创建 K」与已创建子代理清单（`created` / `available` 是**信息**
-  字段，端点缺失时优雅降级）。
+  运行数降到新值以下。设置页每 5 秒轮询 `/dsh-code-pipeline/status`：其中 `running` / `pending`
+  是**单会话最多**（与 `limit` 同口径，因为设置页是全局卡片、无法只显示某一个会话），
+  `sessions` / `totalRunning` / `totalPending` 是**跨会话合计**（仅供诊断）——卡片因此显示
+  「当前运行（单会话最多）N / 单会话上限 M；共 K 个会话在跑（合计 T）」，**不会**把跨会话的
+  合计拿去比上限。`created` / `available` 是全部会话的**信息**字段，端点缺失时优雅降级。
 - **运行数的阶段归属** = 宿主 `subagents.listChildren(parent.id)` 的当前可见行；归属按优先级判定：
   本进程台账 → 活子代理的 `options.stageKey` → label 的 `<stage>/` 前缀（0.2.0 起阶段工具自动给
   `description` 加该前缀，所以宿主持久面上的 label 也是阶段标记）。**重启后**，只靠持久面的
@@ -433,7 +438,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 197 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 200 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -494,6 +499,11 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.4.1（并发上限按会话独立：设置页不再把跨会话运行数合计后比上限）**：
+  - **问题**：准入判定一直以 `parent.id` 为键（A 会话跑满不会占 B 会话名额），但设置页读的 `/dsh-code-pipeline/status` 把**所有会话**的运行数/在途数相加后返回成 `running`/`pending`，于是卡片显示成「当前运行 3 / 上限 2」——把「每个会话独立」误显示成「所有会话合计」。
+  - **做法**：status 的 `running` / `pending` 改为**单会话最多**（与 `limit` 同口径），新增 `sessions` / `totalRunning` / `totalPending` 作为跨会话合计（仅诊断）；设置卡片改为「当前运行（单会话最多）N / 单会话上限 M；共 K 个会话在跑（合计 T）」。`created` / `available` 标注为「全部会话」。
+  - **验证**：冒烟 P7（两个会话各 `limit=1` 时都能派发、各自到自己的 limit 才被拒；status 的 `running < totalRunning` 且 `sessions ≥ 2`）。断言数 **197 → 200**、0 failure。
+  - 版本 0.4.0 → 0.4.1。
 - **0.4.0（新工作流一律新派：移除「已创建总量」闸门；plan 不再需要迁就并发预算）**：
   - **根因**：创建总量闸门把「复用优先」变成强制，于是**新工作流**只能被塞进已经做过别的 workstream 的冷子代理——无法压缩，每步重发整段历史（实测 63 步 / 9.7M tokens，每步约 152k），还得靠一句「忽略之前的内容」在 prompt 里硬压，既删不掉上下文也不可靠。0.3.9 用 `plan` 侧的 `parallelismBudget` 把切分压到预算内，但那是治标：它让 plan 少切工作流，而不是让新工作流能有自己的子代理。
   - **做法（移除创建闸门）**：三个阶段工具的 per-(父会话 × 阶段)「已创建总量」上限与 `stageCreationCapReached` / `stageCreationCapUnverifiable` / 观测高水位（`createdObservation` / `collectStageChildren` / `knownStageRows` / `mergeStageRows` / `ledgerStageChildren`）一并删除；`maxConcurrency` 现在只表示**同时运行**上限（默认 0 = 不限制）。运行闸门保留，且**持久面归属改用 `stageOfChildRow`（label 前缀 / 活 agent stageKey）**，所以重启后持久面的运行行也能计入并发数（旧实现只认本进程台账，重启即失明）。
