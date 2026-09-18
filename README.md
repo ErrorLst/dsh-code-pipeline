@@ -437,7 +437,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 ```
 
 `test/watchdog.smoke.mjs` 用假 ctx（假 `agents` / `subagents` / `webServer` / settings 源 +
-可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 204 项断言：阶段工具与 `pipeline_followup`
+可控 `Date.now`）加载真实的 `lib/index.js`，覆盖 209 项断言：阶段工具与 `pipeline_followup`
 注册、阶段工具 description 带 WALL-CLOCK BUDGET、**plan 工具带 WORKSTREAMS 契约**（impl/review
 不带）、预算 0 既不中断也不软警告、**80% 处发一次软警告（steer 到该子代理、不重复发、
 不在跑时不发）**、到点中断一次（目标 id + `ancestor` 授权）、收尾指令经 `delivery: "queue"`
@@ -500,6 +500,12 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.3.7（plan 一开始的成片报错与「提醒洪水」：失败的 read 被记成「读过」+ 一次程序刷 23 条提醒）**：
+  - **实测证据**（`zy_platform_frontend`，plan 子代理 `9f55ce95`，13 步 / 129 次嵌套调用）：第 2 步用一个 `run_code` 程序读 25 个文件，**25 次全部失败** `ToolCallError: limit must be less than or equal to 2000`（它按 persona 的「read whole files」传了 `limit: 2500`）；第 3 步用 `limit: 2000` 重读 23 个，而读卫生守卫把这 23 次**重试**判成了「跨步骤重读」，于是一步之内注入 **23 条 `[read-hygiene]` user 消息**（约 9KB；全会话累计 27 条 / 11KB，全部是假警报）。第 10–11 步另有 6 次 `binding arguments must be lossless JSON`：子代理把 `include: undefined` 传给了 `tools.grep`，PTC 绑定的 lossless-JSON 校验在派发前就否决了整个参数对象。
+  - **做法（插件侧，两个 bug）**：① `tools/post-execute` 的 `result.isError === true` 时**既不记历史也不提醒**——超限 / 文件不存在 / 被策略拒绝的调用什么都没进上下文，把它们记成「已经读过」必然让下一次重试变成假警报；② 同一个 `run_code` 程序里触发的提醒**攒到程序结束（外层调用）再合成一条**汇总，不再逐个文件挂 user 消息。
+  - **做法（提示侧）**：三段 persona、`files` 清单块与预设 `### Step economy` 都写明两个坑——`tools.read` 的 `limit` 上限就是默认值 2000，整文件读法是**省略 `limit`**（传更大值会让整批调用全失败）；可选参数要**省略键**，不要传 `undefined` 值（`{ include: undefined }` 在派发前就被拒）。
+  - **验证**：冒烟 I8（失败的 read 不计入历史）、I9×2（一次程序重读 23 个文件 → 只发一条汇总，最多列 8 个路径）、I10（主会话 root 级 read 仍当场发单文件提醒）、J4（`files` 渲染带上两个坑的说明）。断言数 **204 → 209**、0 failure。
+  - 版本 0.3.6 → 0.3.7。**预设改动需要手动同步**（自动安装不覆盖已有预设）。
 - **0.3.6（`files` 从「可选、靠协议」升级为必填派发契约）**：
   - **问题**：0.3.5 给三个阶段加了 `files` 并写了协议，但它是**可选的**——主代理不填，插件既不警告也不拒绝，子代理就退回「从零重新发现」，正是 0.3.5 记录的那个 20 步 / 48 文件模式。你对该机制的预期是「主会话每次都会给子代理发一份文件清单」，而可选字段给不了这个保证。
   - **做法**：`files` 成为**必填**。缺省（undefined / 空串）时派发直接被拒，错误信息点名 `files` 并给出两种合法写法：① 一行一个路径的候选清单；② 单个 `-`，显式声明「没有候选清单」。后一种让子代理收到一段「自己做侦察（glob/grep），但仍要在一个程序里把候选读完」的指令——它保证主代理**总是有意识地做出选择**，而不是静默省略。三个工具的 CONTRACT description 改为 `files (REQUIRED …)`，persona 改为「dispatch 总是带 `files`；为 `-` 时自己做侦察」，预设 `### Step economy` 对应条目同步写明「缺省会被拒绝」。

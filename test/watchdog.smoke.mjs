@@ -1900,36 +1900,64 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
   const postExecute = (hi.handlers.get('tools/post-execute') ?? []).at(-1);
   const downstream = async () => ({ kind: 'accept' });
   const reader = { id: 'read-hygiene-agent' };
-  const call = (programId, name, args) => postExecute({ agent: reader, rootCallId: programId, callId: programId + ':1', name, arguments: args }, {}, downstream);
+  // 嵌套 read（run_code 内部）：rootCallId 指外层调用，callId 是自己的 → 提醒攒到程序结束。
+  const nested = (programId, name, args, result = {}) => postExecute({ agent: reader, rootCallId: programId, callId: programId + ':ptc:1', name, arguments: args }, result, downstream);
+  // root 调用（外层 run_code 收尾，或主会话里的顶层调用）：rootCallId 与 callId 相同。
+  const root = (id, name, args) => postExecute({ agent: reader, rootCallId: id, callId: id, name, arguments: args }, {}, downstream);
+  const texts = (out) => (out?.additionalContexts ?? []).map((message) => String(message.content?.[0]?.text ?? ''));
+  const rootRun = (programId) => root(programId, 'run_code', {});
   check('I1 读卫生监听器已注册', typeof postExecute === 'function');
   // 同一 run_code 程序里的两次读 = 我们要鼓励的批量化，不提醒。
-  await call('prog-batch', 'read', { file_path: '/tmp/rh0.js', offset: 1, limit: 100 });
-  const batched = await call('prog-batch', 'read', { file_path: '/tmp/rh0.js', offset: 101, limit: 100 });
-  check('I2 同一程序内的重复读不提醒（那正是批量化）', batched?.additionalContexts === undefined, JSON.stringify(batched).slice(0, 120));
+  await nested('prog-batch', 'read', { file_path: '/tmp/rh0.js', offset: 1, limit: 100 });
+  await nested('prog-batch', 'read', { file_path: '/tmp/rh0.js', offset: 101, limit: 100 });
+  check('I2 同一程序内的重复读不提醒（那正是批量化）', texts(await rootRun('prog-batch')).length === 0);
   // 跨步骤、且被另一个文件的读隔开 —— 0.3.3 漏掉的正是这种。
-  await call('prog-1', 'read', { file_path: '/tmp/rh.js', offset: 1, limit: 100 });
-  await call('prog-2', 'read', { file_path: '/tmp/other.js', offset: 1, limit: 100 });
-  const chunked = await call('prog-3', 'read', { file_path: '/tmp/rh.js', offset: 101, limit: 100 });
+  await nested('prog-1', 'read', { file_path: '/tmp/rh.js', offset: 1, limit: 100 });
+  await nested('prog-2', 'read', { file_path: '/tmp/other.js', offset: 1, limit: 100 });
+  await nested('prog-3', 'read', { file_path: '/tmp/rh.js', offset: 101, limit: 100 });
+  const chunked = await rootRun('prog-3');
   check(
-    'I3 跨步骤同文件重复读 → 提醒（被其它文件隔开也算）',
+    'I3 跨步骤同文件重复读 → 提醒（被其它文件隔开也算；程序结束才发）',
     chunked?.additionalContexts?.length === 1
       && chunked.additionalContexts[0].source?.kind === 'plugin'
       && chunked.additionalContexts[0].role === 'user'
       && String(chunked.additionalContexts[0].content?.[0]?.text ?? '').includes('read-hygiene'),
     JSON.stringify(chunked?.additionalContexts ?? []).slice(0, 200),
   );
-  const third = await call('prog-4', 'read', { file_path: '/tmp/rh.js', offset: 201, limit: 100 });
-  check('I4 同一文件只提醒一次', third?.additionalContexts === undefined, JSON.stringify(third).slice(0, 120));
+  await nested('prog-4', 'read', { file_path: '/tmp/rh.js', offset: 201, limit: 100 });
+  check('I4 同一文件只提醒一次', texts(await rootRun('prog-4')).length === 0);
   // 满窗、不重叠 = 文件超过工具上限时的被迫分块，不提醒。
-  await call('prog-5', 'read', { file_path: '/tmp/rh2.js', offset: 1, limit: 2000 });
-  const capped = await call('prog-6', 'read', { file_path: '/tmp/rh2.js', offset: 2001, limit: 2000 });
-  check('I5 满窗且不重叠的被迫分块不提醒', capped?.additionalContexts === undefined, JSON.stringify(capped).slice(0, 120));
+  await nested('prog-5', 'read', { file_path: '/tmp/rh2.js', offset: 1, limit: 2000 });
+  await nested('prog-6', 'read', { file_path: '/tmp/rh2.js', offset: 2001, limit: 2000 });
+  check('I5 满窗且不重叠的被迫分块不提醒', texts(await rootRun('prog-6')).length === 0);
   // 整文件重读（窗口重叠）→ 提醒。
-  await call('prog-7', 'read', { file_path: '/tmp/rh3.js', offset: 1, limit: 3000 });
-  const rereadWhole = await call('prog-8', 'read', { file_path: '/tmp/rh3.js', offset: 1, limit: 2000 });
-  check('I6 整文件重读（窗口重叠）→ 提醒', rereadWhole?.additionalContexts?.length === 1, JSON.stringify(rereadWhole?.additionalContexts ?? []).slice(0, 160));
-  const grep = await call('prog-9', 'grep', { pattern: 'x' });
-  check('I7 非 read 工具不触发', grep?.additionalContexts === undefined, JSON.stringify(grep).slice(0, 120));
+  await nested('prog-7', 'read', { file_path: '/tmp/rh3.js', offset: 1, limit: 3000 });
+  await nested('prog-8', 'read', { file_path: '/tmp/rh3.js', offset: 1, limit: 2000 });
+  check('I6 整文件重读（窗口重叠）→ 提醒', (await rootRun('prog-8'))?.additionalContexts?.length === 1);
+  await nested('prog-9', 'grep', { pattern: 'x' });
+  check('I7 非 read 工具不触发', texts(await rootRun('prog-9')).length === 0);
+  // 0.3.7 的两个真实事故：失败的 read 被当成「已经读过」，以及一次程序里刷出 23 条提醒。
+  await nested('prog-f1', 'read', { file_path: '/tmp/rh-fail.js', offset: 1, limit: 2500 }, { isError: true });
+  await nested('prog-f2', 'read', { file_path: '/tmp/rh-fail.js', offset: 1, limit: 2000 });
+  const afterFail = texts(await rootRun('prog-f2'));
+  check('I8 失败的 read 不计入历史（limit 超限后重试不触发假警报）', afterFail.length === 0, JSON.stringify(afterFail).slice(0, 200));
+  for (let index = 0; index < 23; index += 1) await nested('prog-seed', 'read', { file_path: '/tmp/bulk-' + index + '.js', offset: 1, limit: 2000 });
+  for (let index = 0; index < 23; index += 1) await nested('prog-storm', 'read', { file_path: '/tmp/bulk-' + index + '.js', offset: 1, limit: 2000 });
+  const storm = await rootRun('prog-storm');
+  check(
+    'I9 一次程序重读 23 个文件 → 只发一条汇总（不是 23 条 user 消息）',
+    storm?.additionalContexts?.length === 1 && String(storm.additionalContexts[0].content?.[0]?.text ?? '').includes('re-read 23 file(s)'),
+    JSON.stringify(texts(storm).map((text) => text.slice(0, 120))),
+  );
+  check('I9 汇总里最多列 8 个路径，其余折成计数（不让提醒本身变成洪水）', String(storm?.additionalContexts?.[0]?.content?.[0]?.text ?? '').includes('more)'), String(storm?.additionalContexts?.[0]?.content?.[0]?.text ?? '').slice(0, 200));
+  // 主会话的 root 级 read（没有 run_code 包裹）仍然当场发单文件提醒。
+  await root('root-r1', 'read', { file_path: '/tmp/root.js', offset: 1, limit: 100 });
+  const rootNotice = await root('root-r2', 'read', { file_path: '/tmp/root.js', offset: 50, limit: 100 });
+  check(
+    'I10 root 级 read（主会话）当场发单文件提醒，措辞仍是 This is read #N',
+    rootNotice?.additionalContexts?.length === 1 && String(rootNotice.additionalContexts[0].content?.[0]?.text ?? '').includes('This is read #2'),
+    JSON.stringify(texts(rootNotice)),
+  );
 }
 
 // ── J. files 清单：入参 schema + 派发时的「先批量读完」硬指令 ──────────────────
@@ -1951,6 +1979,12 @@ const listedIds = (message) => [...String(message ?? '').matchAll(/- (\S+)\s+"[^
       && childPrompt.includes('packages/plugin-api/src/context.ts')
       && childPrompt.includes('apps/desktop/src/shared/ipc-contract.ts'),
     childPrompt.slice(Math.max(0, childPrompt.indexOf('**files**')), childPrompt.indexOf('**files**') + 240),
+  );
+  // 0.3.7：清单渲染里带上两个真实踩过的坑（read 的 limit 上限、undefined 值键）。
+  check(
+    'J4 files 指令带上两个已知坑：read 的 limit 上限 与 undefined 值键',
+    childPrompt.includes('OMITTING `limit`') && childPrompt.includes('non-lossless JSON'),
+    childPrompt.slice(-240),
   );
 }
 
