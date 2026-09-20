@@ -2057,6 +2057,43 @@ const statusOfHarness = async (harness) => {
   );
 }
 
+// ── W13/W14. 0.4.7：把「读有下限」告知 agent（派发块实时数值 + 阶段 persona + 预设 persona）──
+{
+  const promptOf = (harness) => {
+    let text = String(harness.calls.startPrompts.at(-1) ?? '');
+    if (!text.includes('**files**')) {
+      const m = text.match(/written to temp file: (\S+)/);
+      if (m) { try { text = readFileSync(m[1], 'utf8'); } catch {} }
+    }
+    return text;
+  };
+  const hf = await newHarness('read-widen-notify', capStages(0));
+  await attempt(hf, 'subagent_plan', { description: 'floor notify default' });
+  const defaultPrompt = promptOf(hf);
+  check('W13 派发块注入实时下限（默认 ' + plugin.READ_WIDEN_DEFAULT_LINES + ' 行）',
+    defaultPrompt.includes('Your READ FLOOR is ' + plugin.READ_WIDEN_DEFAULT_LINES + ' lines'),
+    defaultPrompt.slice(-260),
+  );
+  check('W13 下限句带反小窗指令（NEVER chunk one file）',
+    defaultPrompt.includes('NEVER chunk one file into successive small reads'),
+  );
+  check('W13 阶段 persona 带反小窗指令',
+    String(hf.calls.startPersonas.at(-1) ?? '').includes('NEVER chunk one file into successive small reads'),
+  );
+  hf.settings.readWidenMinLines = 500;
+  await attempt(hf, 'subagent_plan', { description: 'floor 500' });
+  check('W13 设置 500 → 派发块数值跟随（设置即时生效）', promptOf(hf).includes('Your READ FLOOR is 500 lines'));
+  hf.settings.readWidenMinLines = 0;
+  await attempt(hf, 'subagent_plan', { description: 'floor off' });
+  check('W13 下限 0 → 派发块注明拓宽已关闭', promptOf(hf).includes('Read widening is disabled'));
+  delete hf.settings.readWidenMinLines;
+
+  const presetText = readFileSync(join(root, 'preset', 'code-pipeline', 'agent.cordis.yml'), 'utf8');
+  check('W14 预设 persona 写明 read 下限（default ' + plugin.READ_WIDEN_DEFAULT_LINES + '）',
+    presetText.includes('Reads carry a FLOOR') && presetText.includes('default ' + plugin.READ_WIDEN_DEFAULT_LINES),
+  );
+}
+
 // ── J. files 清单：入参 schema + 派发时的「先批量读完」硬指令 ──────────────────
 {
   const { readFileSync } = await import('node:fs');
