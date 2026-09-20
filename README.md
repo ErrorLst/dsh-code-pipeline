@@ -272,6 +272,10 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
 
 > 无 fallback 孪生工具:阶段 provider/凭据/启动失败时直接报错并报告,不自动换路由。
 
+> **read 读取窗口下限（`readWidenMinLines`）默认 2000**（= read 工具上限，等价于
+> 整窗）：本预设代理发出的 read，`limit` 低于该值会在执行前被就地拓宽到该值，超过
+> 2000 的治愈为 2000；`0` = 关闭。见「read 读取窗口拓宽（一次多读）」。
+
 ## 思考等级(reasoningEffort)
 
 每阶段可在设置页配置「思考等级」。**选项按所选模型的实际支持面列出**——host
@@ -383,6 +387,38 @@ dsh 0.1.5-rc.1 起宿主 `agent-default-model` 的默认模型 id；旧 id
   - `GET /dsh-code-pipeline/status` 每阶段新增 `budgetMinutes` / `timedOut` /
     `longestRunningMs`；设置卡片显示「墙钟预算 N 分钟；最早已运行 M 分钟；K 个已超时（中断 / 收尾中）」。
     （0.2.0 起同一端点还返回 `created` / `available`，见「每阶段并发上限与并行派发」。）
+
+## read 读取窗口拓宽（一次多读）
+
+**问题**：模型（尤其阶段子代理）常对一个文件「几十行几十行」地翻——一个 `run_code`
+程序读 50 行，思考一步，再开一个程序读下 50 行。每多一步都要把整段上下文重发一遍
+（实测 impl 子代理单轮 62 步、97% 的 token 是上下文重发），而多读的那点内容只随上下文
+重发一次：**步数才是大头**。persona 的 CONTEXT ECONOMICS 与读卫生提醒
+（`[read-hygiene]`）都只能「劝」，模型照样小窗分页。
+
+**做法（机制保证，不靠自觉）**：插件在宿主的 `tools/execute` around-waterfall 上
+（官方 around-dispatch 扩展点，`dispatchScheduledExecution` 把 exec 作为共享可变对象
+传进瀑布）对本预设代理——主会话 root（组合了 code-pipeline 预设）+ 阶段子代理
+（派发时打在 `agentOptions` 上的 `stageKey` 标记）——发出的 `read` 做**执行前参数
+改写**，在 `next()` 之前就地改写 `exec.arguments`：
+
+- `limit` 低于下限 → 拓宽到下限（默认 **2000** = read 工具上限，等价于整窗 / 省略 `limit`）；
+- `limit` 超过 2000 → **治愈**为 2000（read 工具对超上限直接报错；0.3.7 实测一次
+  `limit: 2500` 让 25 个 read 全部失败、下一步全部重读）；
+- `limit` 缺省（宿主默认就是整窗）或已 ≥ 下限 → 不动，尊重模型的显式选择。
+
+为什么默认整窗也不心疼：本预设所有代理都是 PTC（Code Mode），`read` 只在 `run_code`
+程序内部发生——**嵌套工具结果只进程序、不进模型历史**，拓宽本身零 token 成本，却让
+一个程序一次拿足上下文；模型只为它 PRINT 的蒸馏结果付费。结果自带行号与
+`totalLines`，窗口被拓宽是自描述的。post-execute 的读卫生观察看到的是拓宽后的参数
+（同一个 exec 对象），拓宽过的读按满窗记账，不会被误判成「小窗口分页」。非本预设的
+会话不受影响；判定或改写抛错时退回原始参数，绝不阻塞读取本体。
+
+**设置**：Settings → 代码流水线 → 「read 读取窗口下限（行）」（`readWidenMinLines`），
+默认 `2000`；`0` = 关闭拓宽。改动立即对后续 read 生效，无需重启。
+
+**验证**：冒烟 W1–W11（小 limit 拓宽 / 超上限治愈 / 下限可调可关 / 非本预设代理
+不动 / 非 read 工具不动 / `offset` 等其余参数保留 / 判定服务抛错不阻塞读取）。
 
 ## 重要实现事实（与官方 dsh 源码核对）
 
@@ -500,6 +536,11 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
 
 ## 变更记录
 
+- **0.4.5（read 读取窗口拓宽：执行前把小 limit 拓宽到下限，超上限治愈为 2000）**：
+  - **问题**：模型对同一文件「几十行几十行」地翻——一个程序读 50 行、思考一步、再开一个程序读下 50 行。每多一步重发整段上下文（实测 impl 单轮 62 步、97% cacheRead），多读的内容只随上下文重发一次，**步数才是大头**；persona（CONTEXT ECONOMICS）与读卫生提醒只能「劝」，照样小窗分页。另外 read 对超上限 limit 直接报错（0.3.7 一次 `limit: 2500` 让 25 个 read 全部失败、下一步全部重读）。
+  - **做法（机制保证）**：插件在宿主 `tools/execute` around-waterfall（官方 around-dispatch 扩展点，exec 为共享可变对象）上，对本预设代理（root = `composedPreset` 命中本预设；阶段子代理 = `agentOptions.stageKey` 标记）发出的 `read`，在 `next()` 之前就地改写 `exec.arguments`：`limit` < 下限 → 拓宽到下限（默认 2000 = 工具上限 = 整窗）；`limit` > 2000 → 治愈为 2000；缺省或已 ≥ 下限 → 不动。PTC 下 read 只在 run_code 程序内发生，嵌套结果只进程序不进历史——拓宽零 token 成本，一个程序拿足上下文。读卫生观察看到的是拓宽后参数（同一 exec 对象），不会误判分页；判定/改写抛错退回原始参数，绝不阻塞读取。新增设置项 `readWidenMinLines`（设置页「read 读取窗口下限（行）」，默认 2000，`0` = 关闭，立即生效，`lib/client.js` 卡片同步）；三段 persona 的 TOOL GOTCHAS 与 `files` 清单指令同步说明「小 limit 会被自动拓宽、超上限会被治愈——宽窗结果直接用，不要为更窄的视图重读」。
+  - **验证**：冒烟 W1–W11（监听器注册；阶段子代理 50→2000 且 next 透传；root 同样拓宽；非本预设代理不动；2500→2000 治愈；limit 缺省不动；下限 500 时 60→500、800 尊重原值；`0` = 关闭；非 read 工具不动；offset 保留；纯函数边界；判定服务抛错不阻塞读取）。断言数 **206 → 222**、0 failure。
+  - 版本 0.4.4 → 0.4.5。
 - **0.4.4（plan 人工闸门取消修订次数上限：循环由用户门控）**：
   - **问题**：预设原写「闸门反馈最多两轮修订，之后停止并报告」。但闸门每一轮修订都必须等用户下一条消息才可能发生——它不是一个自主循环，用固定次数截断只会在用户还想继续改方向时强行停下。
   - **做法（纯 persona 文本）**：删除 `at most two revisions, then stop and report`，改为「**没有修订次数上限**：修订轮只发生在用户给出新方向之后，循环由用户控制，直到用户批准或明确叫停」。同一任务仍只用一个 planner（`pipeline_followup` 续用，禁止对同一任务第二次 `subagent_plan`）——去掉的只是轮次上限，不是复用纪律。README「人工闸门」同步。

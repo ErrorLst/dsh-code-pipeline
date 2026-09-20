@@ -2,7 +2,8 @@
 //
 // 覆盖：预算到点 -> 中断 + queue 收尾投递；80% 软警告（only once / 只在运行中）；预算 0 不误伤；
 //       子代理自行 settle 不误伤；收尾宽限用尽 -> 第二次中断（硬停）；宿主缺 interrupt /
-//       父代理缺失时只告警；status 端点新字段；阶段工具 description 的墙钟与 workstreams 文案。
+//       父代理缺失时只告警；status 端点新字段；阶段工具 description 的墙钟与 workstreams 文案；
+//       read 窗口拓宽（W：小 limit 拓宽到下限 / 超上限治愈为 2000 / 下限可调可关 / 非本预设代理不动 / 纯函数边界）。
 //
 // 运行：node test/watchdog.smoke.mjs（或 npm test）
 // 依赖：@deepseek-ai/schemastery 必须可解析（pnpm install，或本地开发时链接宿主副本）。
@@ -1981,6 +1982,67 @@ const statusOfHarness = async (harness) => {
     rootNotice?.additionalContexts?.length === 1 && String(rootNotice.additionalContexts[0].content?.[0]?.text ?? '').includes('This is read #2'),
     JSON.stringify(texts(rootNotice)),
   );
+}
+
+
+// ── W. read 窗口拓宽（0.4.5）：tools/execute 执行前把小 limit 拓宽、超上限治愈 ──
+{
+  const hw = await newHarness('read-widen', capStages(0));
+  const widenListener = (hw.handlers.get('tools/execute') ?? []).at(-1);
+  check('W1 tools/execute 拓宽监听器已注册', typeof widenListener === 'function');
+  let nextResult = null;
+  const run = async (agent, name, args) => {
+    const exec = { agent, name, arguments: args, callId: 'c1', rootCallId: 'c1' };
+    nextResult = await widenListener(exec, async () => ({ kind: 'passed-through' }));
+    return exec;
+  };
+  const stageChild = { id: 'widen-impl-child', options: { stageKey: 'impl' } };
+  const foreignRoot = hw.addForeignRoot('widen-foreign');
+
+  const w2 = await run(stageChild, 'read', { file_path: '/tmp/w1.js', offset: 1, limit: 50 });
+  check('W2 阶段子代理小 limit（50）被拓宽到默认 2000（一次多读）', w2.arguments.limit === 2000, JSON.stringify(w2.arguments));
+  check('W2 next() 结果原样透传（不吞执行链）', nextResult?.kind === 'passed-through', JSON.stringify(nextResult));
+  const w3 = await run(hw.parent, 'read', { file_path: '/tmp/w2.js', offset: 10, limit: 80 });
+  check('W3 本预设 root 的 read 同样拓宽', w3.arguments.limit === 2000, JSON.stringify(w3.arguments));
+  const w4 = await run(foreignRoot, 'read', { file_path: '/tmp/w3.js', offset: 1, limit: 80 });
+  check('W4 非本预设代理不受影响（不越界改写）', w4.arguments.limit === 80, JSON.stringify(w4.arguments));
+  const w5 = await run(stageChild, 'read', { file_path: '/tmp/w4.js', limit: 2500 });
+  check('W5 超上限 limit:2500 被治愈为 2000（0.3.7 的整批失败事故不再发生）', w5.arguments.limit === 2000, JSON.stringify(w5.arguments));
+  const w6 = await run(stageChild, 'read', { file_path: '/tmp/w5.js' });
+  check('W6 limit 缺省不动（宿主默认即整窗）', w6.arguments.limit === undefined, JSON.stringify(w6.arguments));
+
+  hw.settings.readWidenMinLines = 500;
+  const w7a = await run(stageChild, 'read', { file_path: '/tmp/w6.js', limit: 60 });
+  check('W7 下限 500：60 → 500', w7a.arguments.limit === 500, JSON.stringify(w7a.arguments));
+  const w7b = await run(stageChild, 'read', { file_path: '/tmp/w7.js', limit: 800 });
+  check('W7 下限 500：800 ≥ 下限 → 尊重原值', w7b.arguments.limit === 800, JSON.stringify(w7b.arguments));
+  hw.settings.readWidenMinLines = 0;
+  const w8 = await run(stageChild, 'read', { file_path: '/tmp/w8.js', limit: 40 });
+  check('W8 readWidenMinLines=0：关闭拓宽', w8.arguments.limit === 40, JSON.stringify(w8.arguments));
+  delete hw.settings.readWidenMinLines;
+
+  const w9 = await run(stageChild, 'grep', { pattern: 'x', limit: 40 });
+  check('W9 非 read 工具不触发拓宽', w9.arguments.limit === 40, JSON.stringify(w9.arguments));
+  const w9b = await run(stageChild, 'read', { file_path: '/tmp/w9.js', offset: 731, limit: 30 });
+  check('W9 拓宽保留其余参数（offset 原样）', w9b.arguments.offset === 731 && w9b.arguments.limit === 2000, JSON.stringify(w9b.arguments));
+
+  check('W10 纯函数边界：非整数 limit / 缺 file_path / floor=0 均不拓宽',
+    plugin.widenReadArguments({ file_path: '/x', limit: 50.5 }, 2000) === undefined
+      && plugin.widenReadArguments({ limit: 50 }, 2000) === undefined
+      && plugin.widenReadArguments({ file_path: '/x', limit: 50 }, 0) === undefined,
+  );
+  check('W10 纯函数边界：limit 恰等于下限不拓宽', plugin.widenReadArguments({ file_path: '/x', limit: 500 }, 500) === undefined);
+  check('W10 normalizeReadWidenFloor：0 关闭 / 非法回默认 / 上限封顶',
+    plugin.normalizeReadWidenFloor(0) === 0
+      && plugin.normalizeReadWidenFloor('abc') === 2000
+      && plugin.normalizeReadWidenFloor(9999) === 2000,
+  );
+
+  const savedGet = hw.ctx.get;
+  hw.ctx.get = () => { throw new Error('presets unavailable'); };
+  const w11 = await run({ id: 'widen-unknown' }, 'read', { file_path: '/tmp/w10.js', limit: 30 });
+  check('W11 判定服务抛错也不阻塞读取（参数原样、next 照常）', w11.arguments.limit === 30 && nextResult?.kind === 'passed-through', JSON.stringify(w11.arguments));
+  hw.ctx.get = savedGet;
 }
 
 // ── J. files 清单：入参 schema + 派发时的「先批量读完」硬指令 ──────────────────
