@@ -2000,10 +2000,10 @@ const statusOfHarness = async (harness) => {
   const foreignRoot = hw.addForeignRoot('widen-foreign');
 
   const w2 = await run(stageChild, 'read', { file_path: '/tmp/w1.js', offset: 1, limit: 50 });
-  check('W2 阶段子代理小 limit（50）被拓宽到默认 2000（一次多读）', w2.arguments.limit === 2000, JSON.stringify(w2.arguments));
+  check('W2 阶段子代理小 limit（50）被拓宽到默认下限（一次多读）', w2.arguments.limit === plugin.READ_WIDEN_DEFAULT_LINES, JSON.stringify(w2.arguments));
   check('W2 next() 结果原样透传（不吞执行链）', nextResult?.kind === 'passed-through', JSON.stringify(nextResult));
   const w3 = await run(hw.parent, 'read', { file_path: '/tmp/w2.js', offset: 10, limit: 80 });
-  check('W3 本预设 root 的 read 同样拓宽', w3.arguments.limit === 2000, JSON.stringify(w3.arguments));
+  check('W3 本预设 root 的 read 同样拓宽', w3.arguments.limit === plugin.READ_WIDEN_DEFAULT_LINES, JSON.stringify(w3.arguments));
   const w4 = await run(foreignRoot, 'read', { file_path: '/tmp/w3.js', offset: 1, limit: 80 });
   check('W4 非本预设代理不受影响（不越界改写）', w4.arguments.limit === 80, JSON.stringify(w4.arguments));
   const w5 = await run(stageChild, 'read', { file_path: '/tmp/w4.js', limit: 2500 });
@@ -2024,7 +2024,7 @@ const statusOfHarness = async (harness) => {
   const w9 = await run(stageChild, 'grep', { pattern: 'x', limit: 40 });
   check('W9 非 read 工具不触发拓宽', w9.arguments.limit === 40, JSON.stringify(w9.arguments));
   const w9b = await run(stageChild, 'read', { file_path: '/tmp/w9.js', offset: 731, limit: 30 });
-  check('W9 拓宽保留其余参数（offset 原样）', w9b.arguments.offset === 731 && w9b.arguments.limit === 2000, JSON.stringify(w9b.arguments));
+  check('W9 拓宽保留其余参数（offset 原样）', w9b.arguments.offset === 731 && w9b.arguments.limit === plugin.READ_WIDEN_DEFAULT_LINES, JSON.stringify(w9b.arguments));
 
   check('W10 纯函数边界：非整数 limit / 缺 file_path / floor=0 均不拓宽',
     plugin.widenReadArguments({ file_path: '/x', limit: 50.5 }, 2000) === undefined
@@ -2034,8 +2034,8 @@ const statusOfHarness = async (harness) => {
   check('W10 纯函数边界：limit 恰等于下限不拓宽', plugin.widenReadArguments({ file_path: '/x', limit: 500 }, 500) === undefined);
   check('W10 normalizeReadWidenFloor：0 关闭 / 非法回默认 / 上限封顶',
     plugin.normalizeReadWidenFloor(0) === 0
-      && plugin.normalizeReadWidenFloor('abc') === 2000
-      && plugin.normalizeReadWidenFloor(9999) === 2000,
+      && plugin.normalizeReadWidenFloor('abc') === plugin.READ_WIDEN_DEFAULT_LINES
+      && plugin.normalizeReadWidenFloor(9999) === plugin.READ_TOOL_MAX_LINES,
   );
 
   const savedGet = hw.ctx.get;
@@ -2043,6 +2043,18 @@ const statusOfHarness = async (harness) => {
   const w11 = await run({ id: 'widen-unknown' }, 'read', { file_path: '/tmp/w10.js', limit: 30 });
   check('W11 判定服务抛错也不阻塞读取（参数原样、next 照常）', w11.arguments.limit === 30 && nextResult?.kind === 'passed-through', JSON.stringify(w11.arguments));
   hw.ctx.get = savedGet;
+
+  // W12（0.4.6 回归）：设置页保存必须写入当前输入值——0.4.5 的 save useCallback
+  // 漏了 readWidenMinLines 依赖，闭包捕获初始渲染值，保存永远把旧值写回 settings.yaml。
+  const clientSource = readFileSync(join(root, 'lib', 'client.js'), 'utf8');
+  check('W12 client.js 的 save 依赖数组包含 readWidenMinLines（保存写旧值的回归）',
+    /\[controller, stages, followupMode, compactionThresholdRatio, readWidenMinLines\]/.test(clientSource),
+  );
+  const fallbackMatch = /READ_WIDEN_FALLBACK = (\d+)/.exec(clientSource);
+  check('W12 客户端兜底默认与插件默认一致',
+    fallbackMatch !== null && Number(fallbackMatch[1]) === plugin.READ_WIDEN_DEFAULT_LINES,
+    String(fallbackMatch?.[1]) + ' vs ' + String(plugin.READ_WIDEN_DEFAULT_LINES),
+  );
 }
 
 // ── J. files 清单：入参 schema + 派发时的「先批量读完」硬指令 ──────────────────
