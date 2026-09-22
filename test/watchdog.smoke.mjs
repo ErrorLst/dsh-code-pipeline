@@ -2161,6 +2161,95 @@ const statusOfHarness = async (harness) => {
   check('M2 impl 派发也没有 parallelismBudget', !promptOf(implementer).includes('parallelismBudget'), promptOf(implementer).slice(0, 160));
 }
 
+// ── H. dsh 0.1.7：volatile Config + configEditor 预设声明对账 ───────────────────
+// 0.1.6 的 installSection / .agent-presets 写盘链由 F/G 覆盖；这里覆盖新宿主：
+//   - reconcileCompactionPlugins（纯函数，递归 group）；
+//   - apply 收到 .volatile() 引用 + configEditor 时，启动即对账，且 loader/
+//     volatile-update 防抖后再对账。
+{
+  const ratioCfg = (t, r) => ({ thresholdRatio: t, retainRatio: r });
+  const basePlugins = () => [
+    { id: 'persona', name: '@deepseek-ai/dsh-persona' },
+    { id: 'compaction', name: 'cordis:group', group: true, config: [
+      { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic', config: ratioCfg(0.5, 0.1) },
+      { id: 'command-compact', name: '@deepseek-ai/dsh-command-compact' },
+    ] },
+  ];
+  const built = plugin.reconcileCompactionPlugins(basePlugins(), plugin.compactionRatios(0.3));
+  check(
+    'H7 reconcileCompactionPlugins 改写 group 内嵌的 compaction-basic（0.3 / 0.06）',
+    built.changed === true
+      && built.plugins[0].id === 'persona'
+      && built.plugins[1].config[0].config.thresholdRatio === 0.3
+      && built.plugins[1].config[0].config.retainRatio === 0.06,
+    JSON.stringify(built.plugins[1].config[0].config),
+  );
+  check(
+    'H8 值已一致时不报告改动（幂等）',
+    plugin.reconcileCompactionPlugins(built.plugins, plugin.compactionRatios(0.3)).changed === false,
+  );
+
+  const settings = { compactionThresholdRatio: 0.3 };
+  const ref = (field) => ({ get: () => settings[field] });
+  const config = {
+    preset: 'code-pipeline',
+    stages: ref('stages'),
+    followupMode: ref('followupMode'),
+    compactionThresholdRatio: ref('compactionThresholdRatio'),
+    readWidenMinLines: ref('readWidenMinLines'),
+  };
+  const events = new Map();
+  const dispatch = (name, payload) => { for (const fn of events.get(name) ?? []) fn(payload); };
+  const on = (name, fn) => {
+    events.set(name, [...(events.get(name) ?? []), fn]);
+    return () => { events.set(name, (events.get(name) ?? []).filter((candidate) => candidate !== fn)); };
+  };
+  const warnings = [];
+  const presetEntry = {
+    options: { id: 'preset-code-pipeline', name: '@deepseek-ai/dsh-agent-preset', config: { id: 'code-pipeline', order: 5, plugins: basePlugins() } },
+  };
+  const edits = [];
+  const editor = {
+    entries: () => [presetEntry],
+    edit: async (entry, change) => {
+      edits.push(entry.options.id);
+      entry.options.config = change(structuredClone(entry.options.config));
+    },
+  };
+  const settingsCtx = {
+    settings: {
+      describe: () => [{ ns: 'dsh-code-pipeline', user: { readWidenMinLines: 1 }, value: {} }],
+      update: async () => {},
+    },
+    logger: { info: () => {}, warn: (message) => warnings.push(String(message)) },
+    on,
+    effect: (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; },
+  };
+  const ctx = {
+    logger: { info: () => {}, warn: (message) => warnings.push(String(message)) },
+    on,
+    effect: (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; },
+    get: (name) => (name === 'configEditor' ? editor : undefined),
+    inject: (deps, cb) => { if (deps.includes('settings')) cb(settingsCtx); },
+  };
+  await plugin.apply(ctx, config);
+  await tick(30);
+  check(
+    'H9 volatile 配置：启动即把 compactionThresholdRatio 写进 preset-code-pipeline 声明行',
+    edits.length >= 1 && presetEntry.options.config.plugins[1].config[0].config.thresholdRatio === 0.3,
+    JSON.stringify({ edits, config: presetEntry.options.config.plugins[1].config[0].config }),
+  );
+  settings.compactionThresholdRatio = 0.4;
+  dispatch('loader/volatile-update', [[]]);
+  await tick(250);
+  check(
+    'H10 loader/volatile-update 防抖后把新值写回声明行（0.4 / 0.08）',
+    presetEntry.options.config.plugins[1].config[0].config.thresholdRatio === 0.4
+      && presetEntry.options.config.plugins[1].config[0].config.retainRatio === 0.08,
+    JSON.stringify(presetEntry.options.config.plugins[1].config[0].config),
+  );
+}
+
 check(
   '假 ctx 全程按宿主契约校验实参形状（startContinuable / prompt / sendMessage 均带 signal）',
   h.calls.startSignals.length > 0

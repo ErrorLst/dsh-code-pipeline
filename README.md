@@ -3,6 +3,12 @@
 DSH bundle plugin：为 `code-pipeline` agent 预设（PTC Code Mode 流水线）**动态注入**
 阶段子代理工具，并允许在设置页配置各阶段子代理使用的模型。
 
+> **dsh 0.1.7 迁移（0.5.0）**
+> - 预设改为随包的声明行 [preset/code-pipeline/cordis.patch.yml](preset/code-pipeline/cordis.patch.yml)（`@deepseek-ai/dsh-agent-preset`），不再写 `$DSH_HOME/.agent-presets`（0.1.7 已不再读取该目录）。
+> - 设置从 `settings.yaml` 的 `code-pipeline` 节迁移到插件 Config 的 volatile 字段：值持久化到 profile 的 Cordis patch（`dsh-code-pipeline` 条目），浏览器端经 `ctx.configForms` 读写。首次启动会把 `settings.yaml` 的 `code-pipeline:` 节改名为 `dsh-code-pipeline:` 交给宿主一次性导入（宿主已改名成 `.imported` 时也会兜底导入）。
+> - 压缩触发比例 `compactionThresholdRatio` 现在写进预设声明的 `compaction-basic` 行（经 `configEditor` 改 profile patch），对新挂载的代理生效。
+> - 本版本要求 **dsh ≥ 0.1.7-alpha.1**（bundle patch 引用了仅 0.1.7 才有的 `@deepseek-ai/dsh-agent-preset`）；0.1.6 及更早请继续用 0.4.7。
+
 ## 解决的问题
 
 `code-pipeline` 预设原本把 3 个 `dsh-tool-subagent` 行（`subagent_plan` /
