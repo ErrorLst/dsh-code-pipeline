@@ -646,7 +646,7 @@ node test/watchdog.smoke.mjs   # 等同于 npm test
   - **问题**：宿主 agent loop 没有步数上限（`packages/core/agent-loop/src/agent.ts` 的 `turn()` 是没有计数器的 `while (true)`），而每多走一步都要重发整个上下文——于是「读一点、再读一点」比「一次读完」贵得多，上下文最后可能只有 ~200k 而累计 token 到 5M。此前协议只说了 "bundling ... into as few programs as practical"，那是能力提示，不是成本说明。
   - **把账写进 persona**：plan / impl / review 三个 persona 各加一段 READ ECONOMICS——合并一步省下≈整个上下文；多读 `W` 只随上下文重发一次、代价≈`W × 剩余步数`；侦察一次（glob/grep）→ 一个程序里 `Promise.all` 读完所有需要的文件/区间 → 不重复读；也不要整仓乱读。impl 额外要求「第一次编辑前，把本 workstream `owned files` 全部一次读完」。
   - **把账写进主代理协议**：预设新增 `### Step economy (read once, read wide)` 小节（同一公式 + 四条纪律，含「把阶段要读的文件放进它派发的 `context`/`plan`，别让它自己去重新发现」）。
-  - **机制侧兜底**：新增 `tools/post-execute` 监听（`{ global: true }`），按 agent 记录上一次 `read` 的窗口；同一文件被切成小窗口续读（重叠/首尾相接）时挂一条 `{kind:'plugin'}` 来源的 read-hygiene 提醒。只在两个窗口都小于 read 工具上限（2000 行）时开火——文件本身超过上限时分块是被迫的；同一文件只提醒一次。只提醒不否决，观察与富化全程 try/catch（宿主里 post-execute 监听器抛错会被记成 `isError`）。
+  - **机制侧兜底**：新增 `tools/post-execute` 监听（`{ global: true }`），按 agent 记录上一次 `read` 的窗口；同一文件被切成小窗口续读（重叠/首尾相接）时挂一条 `{kind:'dsh-code-pipeline'}` 来源的 read-hygiene 提醒（V4 会话格式拒绝 `kind:'plugin'`，来源 kind 必须是生产者自有的名字——用 `kind:'plugin'` 会让宿主在校验/落盘 `agent/inbox/spliced` 时抛 `format v4 message requires a producer-owned source kind`，整轮失败）。只在两个窗口都小于 read 工具上限（2000 行）时开火——文件本身超过上限时分块是被迫的；同一文件只提醒一次。只提醒不否决，观察与富化全程 try/catch（宿主里 post-execute 监听器抛错会被记成 `isError`）。
   - **验证**：决策表单测（分块续读 / 同区间重读 → 提醒；有间隔 / 差异文件 / 到上限 / 非 read / 无 agent → 不提醒；第三次不重复）＋冒烟新增 I1–I5。断言数 **192 → 197**、0 failure。写在 `run_code` 里的分块读同样会被捕获：PTC 的嵌套调用继承 `exec.agent`（`packages/core/tools/src/ptc.ts:545`）并经 `deferContext` 把 `additionalContexts` 传回外层程序结果。
   - 版本 0.3.2 → 0.3.3。**预设改动需要手动同步**（插件自动安装不覆盖已有预设文件）。
 - **0.3.2（紧急修复：0.3.1 的 pipeline_submit 让 plan/review 阶段全部派发失败）**：

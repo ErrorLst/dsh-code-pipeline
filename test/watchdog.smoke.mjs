@@ -1943,7 +1943,8 @@ const statusOfHarness = async (harness) => {
   check(
     'I3 跨步骤同文件重复读 → 提醒（被其它文件隔开也算；程序结束才发）',
     chunked?.additionalContexts?.length === 1
-      && chunked.additionalContexts[0].source?.kind === 'plugin'
+      && chunked.additionalContexts[0].source?.kind === 'dsh-code-pipeline'
+      && chunked.additionalContexts[0].source?.plugin === undefined
       && chunked.additionalContexts[0].role === 'user'
       && String(chunked.additionalContexts[0].content?.[0]?.text ?? '').includes('read-hygiene'),
     JSON.stringify(chunked?.additionalContexts ?? []).slice(0, 200),
