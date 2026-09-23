@@ -7,6 +7,25 @@
 
 ---
 
+## 0.6.1 — 设置页重排：去说明、卡片内网格、保存可见反馈
+
+### 问题
+
+- 设置卡片每个字段都挂一段说明（常显一行 + `<details>` 折叠），再加 intro 与三张阶段卡，纵向要滚很久；用户反馈「不需要说明，全部垂直排列太浪费空间」。
+- 点「保存」后没有任何反馈：`saved` 布尔确实被置 true，但 `controller.set` 触发 configForms 的 revision 回显，同步 effect 里的 `setSaved(false)` 立刻把它抹掉——反馈存在的时间短到看不见。
+
+### 改动
+
+- **去说明**：删除 `HelpText` 组件、intro 段落、三张阶段卡的 hint/detail，以及压缩比例 / read 下限的 HINT/DETAIL 常量。只保留字段标签；实时状态行（`运行 N / 上限 M`、`预算 N 分钟`）也一并删除，客户端不再轮询 `GET /dsh-code-pipeline/status`，卡片只渲染配置。
+- **卡片内网格**：新增 `FIELD_GRID_STYLE`（`grid-template-columns: repeat(auto-fit, minmax(190px, 1fr))`）。每张阶段卡里 Provider / 模型 / 思考等级 / 并发 / 预算横向铺开（窄屏自动降列）；三个全局项收进另一张「全局」卡片。字段不再各占一整行。
+- **保存反馈**：`saved` 布尔换成 `saveState`（`idle` / `saving` / `saved` / `error`）。按钮文字依次为 保存 / 保存中… / 已保存 ✓ / 重试保存，旁边有 `aria-live` 状态行；成功态由 2.5s 计时器复位，不再被 revision 回显清空；`controller.set` 抛错时进入 error 态，不再静默吞掉。保存中禁用按钮，卸载时清计时器。
+
+### 验证
+
+- 冒烟 M 块重写（6 项）：断言无 `HelpText` / `<details>`、无 `text:` / `hint:` 文案、字段使用响应式网格、保存三态存在且 revision 回显不再 `setSaved(false)`、不再轮询 `/status` 或渲染运行 / 预算状态行。断言 **239 → 241**、0 failure。
+
+---
+
 ## 0.6.0 — 文档减负 + 宿主安全 + 设置页去口水
 
 ### 破坏性 / 升级注意

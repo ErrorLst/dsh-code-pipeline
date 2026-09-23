@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-code-pipeline",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "DSH bundle 插件：为 code-pipeline 预设注入 plan/impl/review 三阶段子代理工具，模型、并发上限与墙钟预算可在设置页实时配置。",
   "homepage": "https://github.com/ErrorLst/dsh-code-pipeline",
   "repository": {

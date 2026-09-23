@@ -20,8 +20,8 @@ persona / toolFilter 静态钉死在组合里——改模型 = 改 YAML = 重启
   通过 `subagents.start` 请求传入）。
 - **模型选择（动态）**：每次工具调用都读当前设置，保存后**下一次派发**立即生效。
 - **设置页（浏览器）**：`settings.section` 卡片编辑插件 Config 的 volatile 字段；
-  provider / 模型 / 思考等级选项来自 `GET /dsh-code-pipeline/options`（不可用时字段禁用），
-  实时运行状态来自 `GET /dsh-code-pipeline/status`（5 秒轮询）。
+  provider / 模型 / 思考等级选项来自 `GET /dsh-code-pipeline/options`（不可用时字段禁用）；
+  卡片只渲染配置项（无说明文案、无实时状态行）。
 
 ## 安装 / 升级 / 卸载
 
@@ -193,7 +193,7 @@ plan 阶段必须以 `## Workstreams` 表结尾（`id / goal / owned files / dep
 
 ```bash
 npm install              # 或 pnpm install：解析 @deepseek-ai/schemastery 与 yaml
-npm test                 # 假 ctx 集成冒烟（断言数以输出为准，当前 239）
+npm test                 # 假 ctx 集成冒烟（断言数以输出为准，当前 241）
 npm run check:preset     # 与已安装 dsh 的内置 ptc 预设比对
 npm run verify           # 以上两者
 ```

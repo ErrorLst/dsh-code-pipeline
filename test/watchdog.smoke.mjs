@@ -4,7 +4,7 @@
 //       压缩后复用（顺序与失败路径）；别名解析；结构化回执 envelope 与 pipeline_result；
 //       files 契约；read 窗口拓宽与读卫生；status 端点字段；预设内容契约；
 //       宿主安全与契约（K：契约清单对齐 / 缺服务降级 / hook 不抛进宿主 / profile 树引用契约）；
-//       预设漂移检查（L）；设置卡片文案预算（M）。
+//       预设漂移检查（L）；设置卡片布局与保存反馈（M）。
 //
 // 运行：node test/watchdog.smoke.mjs（或 npm test / pnpm verify）
 // 依赖：@deepseek-ai/schemastery 与 yaml 必须可解析（pnpm install）。
@@ -2102,22 +2102,27 @@ const statusOfHarness = async (harness) => {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// M. 设置卡片文案预算（0.6.0）：常显一行、细则折叠
+// M. 设置卡片布局与保存反馈（0.6.1）：无说明文案、字段网格排列、保存可见反馈
 // ════════════════════════════════════════════════════════════════════════════
 {
   const clientSource = readFileSync(join(root, 'lib', 'client.js'), 'utf8');
-  const literals = [
-    ...[...clientSource.matchAll(/\btext:\s*"((?:[^"\\]|\\.)*)"/g)].map((match) => match[1]),
-    ...[...clientSource.matchAll(/\bhint:\s*"((?:[^"\\]|\\.)*)"/g)].map((match) => match[1]),
-  ];
-  const tooLong = literals.filter((value) => value.length > 80);
-  check('M1 常显帮助文案每条 ≤ 80 字符', literals.length > 0 && tooLong.length === 0, JSON.stringify(tooLong));
-  check('M2 长解释走可折叠的 <details>（HelpText 组件）',
-    /React\.createElement\(\s*"details"/.test(clientSource) && /function HelpText\(/.test(clientSource));
+  check('M1 设置卡片已删除说明组件（无 HelpText / <details> 折叠块）',
+    !/function HelpText\(/.test(clientSource) && !/React\.createElement\(\s*"details"/.test(clientSource));
+  check('M2 没有常显帮助文案字面量（text: / hint:）',
+    !/\btext:\s*"/.test(clientSource) && !/\bhint:\s*"/.test(clientSource));
   check('M3 已删除重复的默认模型后缀（下拉框里已经写着）',
     !clientSource.includes('deepseek-official / deepseek-flash 默认'));
-  check('M4 长解释不再在 intro 与字段里重复（"收尾报告" ≤ 2 处）',
-    (clientSource.match(/收尾报告/g) ?? []).length <= 2, String((clientSource.match(/收尾报告/g) ?? []).length));
+  check('M4 字段走响应式网格（gridTemplateColumns），不再全部竖排',
+    /gridTemplateColumns:\s*"repeat\(auto-fit/.test(clientSource));
+  check('M5 保存有可见反馈：保存中 / 已保存 / 失败三态，revision 回显不再清空反馈',
+    /setSaveState\("saving"\)/.test(clientSource)
+      && /setSaveState\("saved"\)/.test(clientSource)
+      && /setSaveState\("error"\)/.test(clientSource)
+      && !/setSaved\(false\)/.test(clientSource));
+  check('M6 设置卡片不再渲染/轮询实时状态（无 /status 轮询与运行 / 预算状态行）',
+    !/dsh-code-pipeline\/status/.test(clientSource)
+      && !/concurrencyStatus/.test(clientSource)
+      && !/wallClockStatus/.test(clientSource));
 }
 
 check(
