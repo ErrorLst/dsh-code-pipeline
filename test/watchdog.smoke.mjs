@@ -1,15 +1,15 @@
-// @dsh-external/dsh-code-pipeline — 假 ctx 集成冒烟：每阶段墙钟预算（0.1.16）
+// @dsh-external/dsh-code-pipeline — 假 ctx 集成冒烟
 //
-// 覆盖：预算到点 -> 中断 + queue 收尾投递；80% 软警告（only once / 只在运行中）；预算 0 不误伤；
-//       子代理自行 settle 不误伤；收尾宽限用尽 -> 第二次中断（硬停）；宿主缺 interrupt /
-//       父代理缺失时只告警；status 端点新字段；阶段工具 description 的墙钟与 workstreams 文案；
-//       read 窗口拓宽（W：小 limit 拓宽到下限 / 超上限治愈为 2000 / 下限可调可关 / 非本预设代理不动 / 纯函数边界）。
+// 覆盖：墙钟预算状态机（软警告 / 中断 / 收尾 / 硬停 / 续跑计时）；运行并发闸门与宿主容量拒绝；
+//       压缩后复用（顺序与失败路径）；别名解析；结构化回执 envelope 与 pipeline_result；
+//       files 契约；read 窗口拓宽与读卫生；status 端点字段；预设内容契约；
+//       宿主安全与契约（K：契约清单对齐 / 缺服务降级 / hook 不抛进宿主 / profile 树引用契约）；
+//       预设漂移检查（L）；设置卡片文案预算（M）。
 //
-// 运行：node test/watchdog.smoke.mjs（或 npm test）
-// 依赖：@deepseek-ai/schemastery 必须可解析（pnpm install，或本地开发时链接宿主副本）。
+// 运行：node test/watchdog.smoke.mjs（或 npm test / pnpm verify）
+// 依赖：@deepseek-ai/schemastery 与 yaml 必须可解析（pnpm install）。
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'yaml';
@@ -54,11 +54,22 @@ function createHarness(parentId = 'parent-1') {
   const tools = new Map();
   const routes = new Map();
   const warnings = [];
+  const infos = [];
   const interrupts = [];
   const queued = [];
   const steers = [];
   const children = new Map();
   const settings = { stages: {} };
+  // dsh 0.1.7 的设置来源是插件 Config 的 volatile 引用（每次调用 .get() 读最新值）：
+  // 这里用一组读取 settings 的假引用，测试照旧在 apply 之后改 settings.<field> 即可生效。
+  const settingsRef = (field) => ({ get: () => settings[field] });
+  const config = {
+    preset: 'code-pipeline',
+    stages: settingsRef('stages'),
+    followupMode: settingsRef('followupMode'),
+    compactionThresholdRatio: settingsRef('compactionThresholdRatio'),
+    readWidenMinLines: settingsRef('readWidenMinLines'),
+  };
   // 宿主调用记账：实参形状与调用次数（宿主契约回归——漏传 signal 会让脚本变红）。
   // promptPayloads 在"判定接受之前"记录每次尝试的载荷：探测表的尝试序列因此可断言
   // （光看 queued[last] 看不出中间试过哪些形状）。
@@ -203,7 +214,7 @@ function createHarness(parentId = 'parent-1') {
   };
 
   const ctx = {
-    logger: { info: () => {}, warn: (message) => warnings.push(String(message)) },
+    logger: { info: (message) => infos.push(String(message)), warn: (message) => warnings.push(String(message)) },
     on: (name, fn) => { handlers.set(name, [...(handlers.get(name) ?? []), fn]); },
     effect: (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; },
     get: (name) => name === 'subagents'
@@ -215,7 +226,12 @@ function createHarness(parentId = 'parent-1') {
           : name === 'webServer'
             ? webServer
             : undefined,
-    inject: (_deps, cb) => cb({ settings: { installSection: (_t, _n, _s, _c, hook) => hook.setSource(() => settings) } }),
+    inject: (_deps, cb) => cb({
+      settings: { describe: () => [], update: async () => {} },
+      on: () => {},
+      effect: (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; },
+      logger: { info: (message) => infos.push(String(message)), warn: (message) => warnings.push(String(message)) },
+    }),
   };
 
   // 阶段子代理的假 agent（结构化 I/O 测试用）：宿主把 startContinuable 的 agentOptions
@@ -237,7 +253,7 @@ function createHarness(parentId = 'parent-1') {
   };
 
   return {
-    ctx, parent, settings, tools, routes, warnings, interrupts, queued, steers, children, handlers,
+    ctx, parent, settings, config, tools, routes, warnings, infos, interrupts, queued, steers, children, handlers,
     agentsService, subagents, calls, presets, childAgents, parentId, host, addForeignRoot, foreignRoots, addStageChild,
     emit: (name, payload) => { for (const fn of handlers.get(name) ?? []) fn(payload); },
   };
@@ -255,14 +271,12 @@ function captureResponse() {
 }
 
 // ── 主体 ────────────────────────────────────────────────────────────────────
-const dshHome = mkdtempSync(join(tmpdir(), 'dsh-code-pipeline-smoke-'));
-mkdirSync(join(dshHome, '.agent-presets'), { recursive: true });
-cpSync(join(root, 'preset', 'code-pipeline'), join(dshHome, '.agent-presets', 'code-pipeline'), { recursive: true });
-process.env.DSH_HOME = dshHome;
-
+// dsh 0.1.7 起预设随包声明（preset/code-pipeline/cordis.patch.yml），插件不再读写
+// $DSH_HOME/.agent-presets，因此这里也不需要临时 DSH_HOME。
 const plugin = await import(new URL('../lib/index.js', import.meta.url));
+const { HOST_CONTRACT } = await import(new URL('../lib/host-contract.js', import.meta.url));
 const h = createHarness();
-await plugin.apply(h.ctx, { preset: 'code-pipeline' });
+await plugin.apply(h.ctx, h.config);
 h.emit('agent/created', { agent: h.parent });
 
 check('三个阶段工具 + pipeline_followup + pipeline_result 已注册', h.tools.size === 5, 'got ' + h.tools.size);
@@ -571,7 +585,7 @@ const capStages = (maxConcurrency) => ({
 });
 async function newHarness(parentId, stages) {
   const harness = createHarness(parentId);
-  await plugin.apply(harness.ctx, { preset: 'code-pipeline' });
+  await plugin.apply(harness.ctx, harness.config);
   harness.emit('agent/created', { agent: harness.parent });
   harness.settings.stages = stages ?? capStages(0);
   return harness;
@@ -1097,345 +1111,6 @@ const attemptFollowup = async (harness, child, message, compact) => {
     'E10 评审快照协议锚点在 persona 里（dsh-pipeline-snap + 不写进工作区）',
     persona.includes('dsh-pipeline-snap') && persona.includes('Never write the snapshots inside the workspace'),
   );
-}
-
-// ── F. 压缩触发比例对账器（reconcileCompactionRow，纯函数，可离线单测）──────────
-// 设置页的值要写进**已安装**的预设组合，全靠这个函数：它必须只改 compaction-basic
-// 那一行、覆盖三种用户安装态、幂等，且行外一个字节都不动（行尾符、注释、persona 块标量）。
-{
-  const { reconcileCompactionRow, compactionRatios } = plugin;
-  const linesOf = (text) => text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
-  const bodies = (text) => linesOf(text).map((line) => line.replace(/\r?\n$|\r$/, ''));
-  // fixture：CRLF + 注释 + persona 块标量 + 前后各一行，一起验证「行外原样」。
-  const fixture = (rowLines) => [
-    '# top comment (must survive byte-for-byte)',
-    '- id: persona',
-    "  name: '@deepseek-ai/dsh-persona'",
-    '  config:',
-    '    prefix: |',
-    '      multi-line persona text',
-    '      stays byte-identical',
-    '- id: compaction',
-    '  name: cordis:group',
-    '  config:',
-    ...rowLines,
-    '    - id: command-compact',
-    "      name: '@deepseek-ai/dsh-command-compact'",
-    '- id: present',
-    "  name: '@deepseek-ai/dsh-tool-present'",
-    '',
-  ].join('\r\n');
-
-  // F1 Case A：行内没有 config:（用户当前的安装态）→ 紧跟 name: 插入 config: 块。
-  const caseA = fixture([
-    '    - id: compaction-basic',
-    "      name: '@deepseek-ai/dsh-compaction-basic'",
-  ]);
-  const a = reconcileCompactionRow(caseA, compactionRatios(0.5));
-  const aLines = bodies(a.text);
-  const aName = aLines.indexOf("      name: '@deepseek-ai/dsh-compaction-basic'");
-  check(
-    'F1 对账器 Case A：没有 config: 的行在 name: 之后补出 config: 块（thresholdRatio / retainRatio）',
-    a.found === true && a.changed === true && aName !== -1
-      && aLines[aName + 1] === '      config:'
-      && aLines[aName + 2] === '        thresholdRatio: 0.5'
-      && aLines[aName + 3] === '        retainRatio: 0.1'
-      && aLines[aName + 4] === '    - id: command-compact',
-    JSON.stringify(aLines.slice(aName, aName + 5)),
-  );
-
-  // F2 Case B：已有阈值 / 保留比例 → 就地替换数值，结构不变。
-  const caseB = fixture([
-    '    - id: compaction-basic',
-    "      name: '@deepseek-ai/dsh-compaction-basic'",
-    '      config:',
-    '        thresholdRatio: 0.8',
-    '        retainRatio: 0.16',
-  ]);
-  const b = reconcileCompactionRow(caseB, compactionRatios(0.5));
-  const bLines = bodies(b.text);
-  check(
-    'F2 对账器 Case B：已有的 thresholdRatio / retainRatio 就地改成 0.5 / 0.1（不增行）',
-    b.changed === true
-      && bLines.includes('        thresholdRatio: 0.5')
-      && bLines.includes('        retainRatio: 0.1')
-      && !bLines.includes('        thresholdRatio: 0.8')
-      && bLines.length === bodies(caseB).length,
-    JSON.stringify(bLines.filter((line) => line.includes('Ratio'))),
-  );
-
-  // F3 Case C：老副本里的 retainTokens: 40000 → retainRatio，两种保留形式绝不同时出现。
-  const caseC = fixture([
-    '    - id: compaction-basic',
-    "      name: '@deepseek-ai/dsh-compaction-basic'",
-    '      config:',
-    '        thresholdRatio: 0.2',
-    '        retainTokens: 40000',
-  ]);
-  const c = reconcileCompactionRow(caseC, compactionRatios(0.5));
-  const cLines = bodies(c.text);
-  check(
-    'F3 对账器 Case C：retainTokens 行被 retainRatio 顶掉（结果里绝不并存两种保留形式）',
-    c.changed === true && !c.text.includes('retainTokens')
-      && cLines.includes('        retainRatio: 0.1')
-      && cLines.includes('        thresholdRatio: 0.5'),
-    JSON.stringify(cLines.filter((line) => line.includes('Ratio') || line.includes('Tokens'))),
-  );
-
-  // F4 幂等：对自己的输出再跑一次，changed === false 且文本逐字节相同。
-  const again = reconcileCompactionRow(a.text, compactionRatios(0.5));
-  check(
-    'F4 对账器幂等：对自身输出再跑一次 changed=false、文本逐字节不变',
-    again.found === true && again.changed === false && again.text === a.text,
-  );
-
-  // F5 派生：保留恒为阈值的 1/5，且严格小于阈值（区间两端 0.05 / 0.8 都成立）。
-  const low = compactionRatios(0.05);
-  const high = compactionRatios(0.8);
-  check(
-    'F5 派生 retainRatio = thresholdRatio / 5 且严格小于阈值（0.05 与 0.8 两端都成立）',
-    low.thresholdRatio === 0.05 && low.retainRatio === Number((0.05 / 5).toFixed(4)) && low.retainRatio < low.thresholdRatio
-      && high.thresholdRatio === 0.8 && high.retainRatio === Number((0.8 / 5).toFixed(4)) && high.retainRatio < high.thresholdRatio
-      && compactionRatios(0.5).retainRatio === 0.1,
-    JSON.stringify({ low, high }),
-  );
-
-  // F6 字节保持：Case B 不改行数，行外每一行（含行尾符）必须逐行相同。
-  const bBefore = bodies(caseB);
-  const bAfter = bodies(b.text);
-  const rowStart = bBefore.indexOf('    - id: compaction-basic');
-  const rowEnd = bBefore.indexOf('    - id: command-compact');
-  check(
-    'F6 对账器只动 compaction-basic 行：行外所有行（含 CRLF 行尾）逐行相同',
-    rowStart !== -1 && rowEnd !== -1 && bAfter.length === bBefore.length
-      && bBefore.slice(0, rowStart).join('\n') === bAfter.slice(0, rowStart).join('\n')
-      && bBefore.slice(rowEnd).join('\n') === bAfter.slice(rowEnd).join('\n')
-      && b.text.includes('\r\n') && !b.text.replace(/\r\n/g, '').includes('\n'),
-  );
-
-  // F8 行尾注释：`config: # 注释` 仍是块风格（先剥注释再判定），不得误判为行内值。
-  const caseD = fixture([
-    '    - id: compaction-basic',
-    "      name: '@deepseek-ai/dsh-compaction-basic'",
-    '      config: # 压缩配置',
-    '        retainTokens: 40000',
-  ]);
-  const d = reconcileCompactionRow(caseD, compactionRatios(0.5));
-  check(
-    'F8 行尾注释的块风格 config:（先剥注释再判定）：注释保留、retainTokens 被顶成 retainRatio',
-    d.found === true && d.changed === true && d.unsupported === undefined
-      && d.text.includes('config: # 压缩配置')
-      && !d.text.includes('retainTokens')
-      && bodies(d.text).includes('        thresholdRatio: 0.5')
-      && bodies(d.text).includes('        retainRatio: 0.1'),
-    JSON.stringify(bodies(d.text).filter((line) => line.includes('config') || line.includes('Ratio') || line.includes('Tokens'))),
-  );
-
-  // F7 找不到该行：no-op 且明确报 not found，绝不改写文本。
-  const missing = fixture([
-    '    - id: command-compact',
-    "      name: '@deepseek-ai/dsh-command-compact'",
-  ]);
-  const notFound = reconcileCompactionRow(missing, compactionRatios(0.5));
-  check(
-    'F7 对账器找不到 compaction-basic 行：found=false / changed=false / 文本原样返回',
-    notFound.found === false && notFound.changed === false && notFound.text === missing,
-  );
-}
-
-// ── G. 设置 → 已安装预设组合的写入链（installSection → setSource → 对账 → 写盘）──────
-// F 只测纯函数；这里用假 settings（installSection 直接调 setSource）+ 各自的临时 DSH_HOME
-// 覆盖真正会写盘的那条路：0.3 → 0.3/0.06；组合缺失只告警不创建；没有该行只告警不改写；
-// 行内（flow）config: 与「锚点行没有行尾符」两种形状不得写出不可解析的字节（Issue 1/2）。
-{
-  const originalHome = process.env.DSH_HOME;
-  const installedPath = (home) => join(home, '.agent-presets', 'code-pipeline', 'agent.cordis.yml');
-  const presetHome = (home) => join(home, '.agent-presets', 'code-pipeline');
-  const readIfAny = (home) => (existsSync(installedPath(home)) ? readFileSync(installedPath(home), 'utf8') : undefined);
-  const bareHome = () => mkdtempSync(join(tmpdir(), 'dsh-code-pipeline-chain-'));
-  // 包内预设当前指纹：把它种成「已同步」记录后，ensurePresetInstalled 不会覆盖 fixture，
-  // 于是 G3–G5 仍能测对账器本身（否则会先被自动同步覆盖掉）。
-  const bundleDigest = await plugin.presetBundleDigest(join(root, 'preset', 'code-pipeline'));
-  const seedSync = (home, record = bundleDigest) => {
-    writeFileSync(plugin.presetSyncPath(presetHome(home)), JSON.stringify(record), 'utf8');
-  };
-  const writeHome = (text) => {
-    const home = bareHome();
-    mkdirSync(presetHome(home), { recursive: true });
-    writeFileSync(installedPath(home), text, 'utf8');
-    seedSync(home);
-    return home;
-  };
-  // 走真实接线：apply 里的 installSection 会（同步）调用 setSource，从而触发对账写盘。
-  const applyAt = async (home, parentId, settings) => {
-    process.env.DSH_HOME = home;
-    const harness = createHarness(parentId);
-    Object.assign(harness.settings, settings);
-    await plugin.apply(harness.ctx, { preset: 'code-pipeline' });
-    return harness;
-  };
-  const settle = async (predicate) => {
-    for (let i = 0; i < 100; i += 1) {
-      if (predicate()) return true;
-      await tick(10);
-    }
-    return predicate();
-  };
-  const parses = (text) => {
-    try {
-      parse(text);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  // G1 设置 0.3 → 已安装组合真的被写成 0.3 / 0.06（走 await writeFile 那条路）。
-  {
-    const home = bareHome();
-    await applyAt(home, 'parent-chain-write', { compactionThresholdRatio: 0.3 });
-    await settle(() => (readIfAny(home) ?? '').includes('thresholdRatio: 0.3'));
-    const text = readIfAny(home) ?? '';
-    check(
-      'G1 设置 compactionThresholdRatio=0.3 → 已安装组合被写成 thresholdRatio 0.3 / retainRatio 0.06',
-      text.includes('thresholdRatio: 0.3') && text.includes('retainRatio: 0.06') && !text.includes('retainTokens'),
-      (text.match(/thresholdRatio: \S+|retainRatio: \S+/g) ?? []).join(' | '),
-    );
-  }
-
-  // G2 组合文件缺失：0.4.3 起自动从包内补齐（安装/升级都会补齐，不再只告警）。
-  {
-    const home = bareHome();
-    mkdirSync(presetHome(home), { recursive: true });
-    await applyAt(home, 'parent-chain-missing', { compactionThresholdRatio: 0.3 });
-    await settle(() => (readIfAny(home) ?? '').includes('thresholdRatio: 0.3'));
-    const text = readIfAny(home) ?? '';
-    check(
-      'G2 已安装组合缺失：自动从包内补齐、写入同步记录，并照常对账压缩比例',
-      existsSync(installedPath(home))
-        && text.includes('agent preset')
-        && text.includes('thresholdRatio: 0.3')
-        && existsSync(plugin.presetSyncPath(presetHome(home))),
-      JSON.stringify({ created: existsSync(installedPath(home)), ratio: (text.match(/thresholdRatio: \S+/) ?? [])[0] }),
-    );
-  }
-
-  // G3 组合里没有 compaction-basic 行：只告警，文件逐字节不变。
-  {
-    const noRow = [
-      '- id: persona',
-      "  name: '@deepseek-ai/dsh-persona'",
-      '- id: present',
-      "  name: '@deepseek-ai/dsh-tool-present'",
-      '',
-    ].join('\n');
-    const home = writeHome(noRow);
-    const harness = await applyAt(home, 'parent-chain-norow', { compactionThresholdRatio: 0.3 });
-    await tick(30);
-    check(
-      'G3 组合里没有 compaction-basic 行：只告警、文件逐字节不变',
-      readIfAny(home) === noRow
-        && harness.warnings.some((line) => line.includes('has no "- id: compaction-basic" row')),
-      JSON.stringify(harness.warnings.slice(-1)),
-    );
-  }
-
-  // G4 Issue 1：行内（flow）config: 必须 no-op——追加第二个 config: 键会让整份预设无法挂载。
-  {
-    const inlineRow = [
-      '- id: compaction',
-      '  name: cordis:group',
-      '  config:',
-      '    - id: compaction-basic',
-      "      name: '@deepseek-ai/dsh-compaction-basic'",
-      '      config: { thresholdRatio: 0.5, retainRatio: 0.1 }',
-      '    - id: command-compact',
-      "      name: '@deepseek-ai/dsh-command-compact'",
-      '',
-    ].join('\n');
-    const home = writeHome(inlineRow);
-    const harness = await applyAt(home, 'parent-chain-inline', { compactionThresholdRatio: 0.3 });
-    await tick(30);
-    const text = readIfAny(home) ?? '';
-    check(
-      'G4 行内（flow）config: → no-op：不追加第二个 config: 键、文件逐字节不变且仍可解析',
-      text === inlineRow && parses(text)
-        && !text.includes('thresholdRatio: 0.3')
-        && harness.warnings.some((line) => line.includes('inline (flow)')),
-      JSON.stringify({ unchanged: text === inlineRow, parses: parses(text), warnings: harness.warnings.slice(-1) }),
-    );
-  }
-
-  // G5 Issue 2：锚点行（这里是最后一行）没有行尾符——新块必须另起一行，写出的字节必须可解析。
-  {
-    const lastRowNoEol = [
-      '- id: compaction',
-      '  name: cordis:group',
-      '  config:',
-      '    - id: compaction-basic',
-      "      name: '@deepseek-ai/dsh-compaction-basic'",
-    ].join('\n');
-    const home = writeHome(lastRowNoEol);
-    await applyAt(home, 'parent-chain-lasteol', { compactionThresholdRatio: 0.3 });
-    await settle(() => (readIfAny(home) ?? '').includes('thresholdRatio: 0.3'));
-    const text = readIfAny(home) ?? '';
-    check(
-      'G5 锚点行没有行尾符（Issue 2）：新块另起一行、写出的字节仍可被解析',
-      parses(text)
-        && text.includes("      name: '@deepseek-ai/dsh-compaction-basic'\n      config:\n        thresholdRatio: 0.3\n        retainRatio: 0.06"),
-      JSON.stringify(text.slice(-140)),
-    );
-  }
-
-  // G6 包内预设变化（插件升级）→ 自动覆盖已安装副本并写回新同步记录。
-  {
-    const stale = ['# stale installed copy', '- id: persona', '  name: x', ''].join('\n');
-    const home = bareHome();
-    mkdirSync(presetHome(home), { recursive: true });
-    writeFileSync(installedPath(home), stale, 'utf8');
-    seedSync(home, { version: '0.0.1', hash: 'stale-hash' });
-    await applyAt(home, 'parent-chain-refresh', { compactionThresholdRatio: 0.3 });
-    await settle(() => (readIfAny(home) ?? '').includes('thresholdRatio: 0.3'));
-    const text = readIfAny(home) ?? '';
-    const record = JSON.parse(readFileSync(plugin.presetSyncPath(presetHome(home)), 'utf8'));
-    check(
-      'G6 同步记录与包内哈希不一致（插件升级）→ 自动覆盖为包内预设并写回新哈希',
-      !text.includes('# stale installed copy')
-        && text.includes('agent preset')
-        && record.hash === bundleDigest.hash
-        && record.version === bundleDigest.version,
-      JSON.stringify({ refreshed: !text.includes('# stale installed copy'), hashOk: record.hash === bundleDigest.hash }),
-    );
-    const backupRoot = join(tmpdir(), 'dsh-code-pipeline-preset-backup');
-    const backups = existsSync(backupRoot) ? readdirSync(backupRoot) : [];
-    const backedUp = backups.some((name) => {
-      const p = join(backupRoot, name, 'agent.cordis.yml');
-      return existsSync(p) && readFileSync(p, 'utf8').includes('# stale installed copy');
-    });
-    check(
-      'G6 覆盖前的旧副本已备份到 temp（可恢复）',
-      backedUp,
-      JSON.stringify(backups.slice(-3)),
-    );
-  }
-
-  // G7 同步记录与包内一致 → 用户本地改动保留，不被自动同步覆盖。
-  {
-    const localEdit = ['# local edit kept', '- id: persona', '  name: x', ''].join('\n');
-    const home = bareHome();
-    mkdirSync(presetHome(home), { recursive: true });
-    writeFileSync(installedPath(home), localEdit, 'utf8');
-    seedSync(home);
-    await applyAt(home, 'parent-chain-keep', { compactionThresholdRatio: 0.3 });
-    await tick(30);
-    check(
-      'G7 同步记录与包内一致 → 本地改动保留（自动同步只在包内变化时覆盖）',
-      (readIfAny(home) ?? '').includes('# local edit kept'),
-      JSON.stringify((readIfAny(home) ?? '').slice(0, 50)),
-    );
-  }
-
-  process.env.DSH_HOME = originalHome;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2206,6 +1881,7 @@ const statusOfHarness = async (harness) => {
     return () => { events.set(name, (events.get(name) ?? []).filter((candidate) => candidate !== fn)); };
   };
   const warnings = [];
+  const infos = [];
   const presetEntry = {
     options: { id: 'preset-code-pipeline', name: '@deepseek-ai/dsh-agent-preset', config: { id: 'code-pipeline', order: 5, plugins: basePlugins() } },
   };
@@ -2222,12 +1898,12 @@ const statusOfHarness = async (harness) => {
       describe: () => [{ ns: 'dsh-code-pipeline', user: { readWidenMinLines: 1 }, value: {} }],
       update: async () => {},
     },
-    logger: { info: () => {}, warn: (message) => warnings.push(String(message)) },
+    logger: { info: (message) => infos.push(String(message)), warn: (message) => warnings.push(String(message)) },
     on,
     effect: (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; },
   };
   const ctx = {
-    logger: { info: () => {}, warn: (message) => warnings.push(String(message)) },
+    logger: { info: (message) => infos.push(String(message)), warn: (message) => warnings.push(String(message)) },
     on,
     effect: (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; },
     get: (name) => (name === 'configEditor' ? editor : undefined),
@@ -2249,6 +1925,199 @@ const statusOfHarness = async (harness) => {
       && presetEntry.options.config.plugins[1].config[0].config.retainRatio === 0.08,
     JSON.stringify(presetEntry.options.config.plugins[1].config[0].config),
   );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// K. 宿主安全与契约（0.6.0）：插件绝不让 dsh 本身出错
+// ════════════════════════════════════════════════════════════════════════════
+{
+  const pluginSource = readFileSync(join(root, 'lib', 'index.js'), 'utf8');
+  const serviceLiterals = new Set([...pluginSource.matchAll(/getService\([^,]+,\s*"([^"]+)"\)/g)].map((match) => match[1]));
+  const eventLiterals = new Set([...pluginSource.matchAll(/registerHostEvent\(\s*[^,]+,\s*"([^"]+)"/g)].map((match) => match[1]));
+  const contractServices = new Set(HOST_CONTRACT.filter((row) => row.kind === 'service').map((row) => row.id));
+  const contractEvents = new Set(HOST_CONTRACT.filter((row) => row.kind === 'event').map((row) => row.id));
+  const sameSet = (a, b) => a.size === b.size && [...a].every((value) => b.has(value));
+  check('K1 HOST_CONTRACT 的宿主服务清单与代码请求的一致',
+    sameSet(serviceLiterals, contractServices),
+    JSON.stringify({ code: [...serviceLiterals].sort(), contract: [...contractServices].sort() }));
+  check('K1 HOST_CONTRACT 的宿主事件清单与代码注册的一致',
+    sameSet(eventLiterals, contractEvents),
+    JSON.stringify({ code: [...eventLiterals].sort(), contract: [...contractEvents].sort() }));
+
+  // K1b /status 暴露宿主自检 + 注入健康（排障入口，不必翻日志）。
+  const kStatus = captureResponse();
+  await h.routes.get('/dsh-code-pipeline/status')({}, kStatus.res);
+  const kStatusBody = JSON.parse(kStatus.captured.body);
+  const kServiceCount = HOST_CONTRACT.filter((row) => row.kind === 'service').length;
+  check('K1b /status 暴露 host.checks（逐面探测）与 host.injection（注入健康）',
+    Array.isArray(kStatusBody.host?.checks) && kStatusBody.host.checks.length === kServiceCount
+      && typeof kStatusBody.host?.injection?.matched === 'number'
+      && kStatusBody.host.injection.injected >= 1,
+    JSON.stringify({ checks: kStatusBody.host?.checks?.length, injection: kStatusBody.host?.injection }));
+
+  // K2 可缺的服务：apply 不抛、工具照常注册（插件降级而不是挂掉）。
+  const k2 = createHarness('parent-k2');
+  const k2Get = k2.ctx.get;
+  k2.ctx.get = (name) => (name === 'webServer' ? undefined : k2Get(name));
+  let k2Error = null;
+  try { await plugin.apply(k2.ctx, k2.config); } catch (error) { k2Error = error; }
+  k2.emit('agent/created', { agent: k2.parent });
+  check('K2 宿主缺 webServer：apply 不抛，阶段工具照常注册', k2Error === null && k2.tools.size === 5,
+    JSON.stringify({ error: k2Error?.message, tools: k2.tools.size }));
+
+  // K3 必需服务缺失：只记一条指名 host 面的 WARN，不影响启动。
+  const k3 = createHarness('parent-k3');
+  const k3Get = k3.ctx.get;
+  k3.ctx.get = (name) => (name === 'agentPresets' ? undefined : k3Get(name));
+  let k3Error = null;
+  try { await plugin.apply(k3.ctx, k3.config); } catch (error) { k3Error = error; }
+  check('K3 宿主缺 agentPresets：apply 不抛 + 自检点名该宿主面（缺席只记 INFO）',
+    k3Error === null && k3.infos.some((line) => line.includes('agentPresets')) && !k3.warnings.some((line) => line.includes('agentPresets')),
+    JSON.stringify({ error: k3Error?.message, infos: k3.infos.slice(0, 6), warnings: k3.warnings.slice(0, 4) }));
+
+  // K3b 在场但形状不对（缺必需方法）才是真正的宿主 API 漂移 → WARN。
+  const k3b = createHarness('parent-k3b');
+  const k3bGet = k3b.ctx.get;
+  k3b.ctx.get = (name) => (name === 'agentPresets' ? { composedPreset: () => 'code-pipeline' } : k3bGet(name));
+  let k3bError = null;
+  try { await plugin.apply(k3b.ctx, k3b.config); } catch (error) { k3bError = error; }
+  check('K3b 宿主面在场但缺必需方法 → 一条 WARN（形状漂移）',
+    k3bError === null && k3b.warnings.some((line) => line.includes('agentPresets') && line.includes('serviceFor')),
+    JSON.stringify({ error: k3bError?.message, warnings: k3b.warnings.slice(0, 4) }));
+
+  // K4 agent/request 的思考等级注入：读设置抛错时返回**原样** config（绝不打断宿主请求）。
+  const k4 = createHarness('parent-k4');
+  await plugin.apply(k4.ctx, k4.config);
+  k4.config.stages = { get: () => { throw new Error('volatile shape drift'); } };
+  const k4Handlers = k4.handlers.get('agent/request') ?? [];
+  const k4EffortHandler = k4Handlers[k4Handlers.length - 1];
+  const k4Original = { provider: 'deepseek-official', model: 'deepseek-flash' };
+  let k4Returned;
+  let k4Error = null;
+  try {
+    k4Returned = await k4EffortHandler({ agent: { options: { stageKey: 'impl' } } }, async () => k4Original);
+  } catch (error) { k4Error = error; }
+  check('K4 设置引用抛错时 agent/request 返回原样 config 且只告警',
+    k4Error === null && k4Returned === k4Original && k4.warnings.some((line) => line.includes('volatile setting')),
+    JSON.stringify({ error: k4Error?.message, same: k4Returned === k4Original, warnings: k4.warnings.slice(-2) }));
+
+  // K5 subagent/end 对畸形载荷绝不抛（它跑在宿主的 settle 路径上）。
+  const k5 = await newHarness('parent-k5', capStages(0));
+  const malformed = [
+    { lastAssistantMessage: 'not-an-array' },
+    { lastAssistantMessage: [{ type: 'text', text: '```json\n{ not json }\n```' }] },
+    { lastAssistantMessage: [{ type: 'text', text: '```json\n{"no_kind":true}\n```' }] },
+  ];
+  let k5Error = null;
+  for (const payload of malformed) {
+    const started = await runStage(k5, 'subagent_impl', { files: '-' });
+    try { k5.emit('subagent/end', { id: started.subagentId, ...payload }); } catch (error) { k5Error = error; }
+  }
+  try { k5.emit('subagent/end', { id: 12345 }); } catch (error) { k5Error = error; }
+  check('K5 subagent/end 对畸形载荷 / 非法 JSON / 未知 id 不抛', k5Error === null, String(k5Error));
+
+  // K6 profile patch 写入前的纯函数契约：无变化时保持原引用。
+  const k6Tree = [
+    { id: 'compaction', name: 'cordis:group', config: [
+      { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic', config: { thresholdRatio: 0.5, retainRatio: 0.1 } },
+    ] },
+  ];
+  const k6Unchanged = plugin.reconcileCompactionPlugins(k6Tree, plugin.compactionRatios(0.5));
+  const k6Changed = plugin.reconcileCompactionPlugins(k6Tree, plugin.compactionRatios(0.3));
+  check('K6 reconcileCompactionPlugins 无变化时返回原引用（不重建宿主 profile 树）',
+    k6Unchanged.changed === false && k6Unchanged.plugins === k6Tree,
+    JSON.stringify({ changed: k6Unchanged.changed, same: k6Unchanged.plugins === k6Tree }));
+  check('K6 reconcileCompactionPlugins 有变化时只重建祖先且不改原树',
+    k6Changed.changed === true && k6Changed.plugins !== k6Tree
+      && k6Tree[0].config[0].config.thresholdRatio === 0.5
+      && k6Changed.plugins[0].config[0].config.thresholdRatio === 0.3,
+    JSON.stringify({ changed: k6Changed.changed, original: k6Tree[0].config[0].config }));
+
+  // K7 configEditor.edit 失败：只告警，不抛、不写坏宿主 profile。
+  const k7Warnings = [];
+  let k7Edits = 0;
+  const k7Logger = { info: () => {}, warn: (message) => k7Warnings.push(String(message)) };
+  const k7Effect = (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; };
+  const k7Entry = {
+    options: { id: 'preset-code-pipeline', config: { plugins: [
+      { id: 'compaction-basic', name: '@deepseek-ai/dsh-compaction-basic', config: { thresholdRatio: 0.5, retainRatio: 0.1 } },
+    ] } },
+  };
+  const k7Ctx = {
+    logger: k7Logger,
+    on: () => {},
+    effect: k7Effect,
+    get: (name) => (name === 'configEditor'
+      ? { entries: () => [k7Entry], edit: async () => { k7Edits += 1; throw new Error('write refused (simulated)'); } }
+      : undefined),
+    inject: (_deps, cb) => cb({
+      settings: { describe: () => [], update: async () => {} },
+      on: () => {},
+      effect: k7Effect,
+      logger: k7Logger,
+    }),
+  };
+  let k7Error = null;
+  try { await plugin.apply(k7Ctx, { preset: 'code-pipeline', compactionThresholdRatio: { get: () => 0.3 } }); } catch (error) { k7Error = error; }
+  await tick(30);
+  check('K7 configEditor.edit 失败时 apply 不抛且只告警', k7Error === null && k7Warnings.some((line) => line.includes('compaction threshold')),
+    JSON.stringify({ error: k7Error?.message, edits: k7Edits, warnings: k7Warnings.slice(-2) }));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// L. 预设漂移检查（0.6.0）：升级后一行不可解析 = 整份预设挂载失败
+// ════════════════════════════════════════════════════════════════════════════
+{
+  const { comparePresetRows, collectRows, readPresetRows, packageRootOf } = await import('../scripts/check-preset-upstream.mjs');
+  const local = new Map([
+    ['shared', { name: '@deepseek-ai/dsh-tool-fs', disabled: false }],
+    ['local-only', { name: '@deepseek-ai/dsh-tool-web', disabled: false }],
+  ]);
+  const upstream = new Map([
+    ['shared', { name: '@deepseek-ai/dsh-tool-fs', disabled: false }],
+    ['new-row', { name: '@deepseek-ai/dsh-tool-new', disabled: false }],
+    ['off-row', { name: '@deepseek-ai/dsh-tool-off', disabled: true }],
+  ]);
+  const drift = comparePresetRows({ pluginRows: local, upstreamRows: upstream, isResolvable: () => true });
+  check('L1 上游启用但本地缺失的行 → 漂移', drift.ok === false && drift.missingUpstream.some((row) => row.id === 'new-row'),
+    JSON.stringify(drift));
+  check('L2 上游已禁用的缺失行 → 仅信息，不算漂移',
+    drift.upstreamDisabledOnly.some((row) => row.id === 'off-row') && !drift.missingUpstream.some((row) => row.id === 'off-row'));
+  const broken = comparePresetRows({
+    pluginRows: new Map([['x', { name: '@deepseek-ai/dsh-tool-gone', disabled: false }]]),
+    upstreamRows: new Map(),
+    isResolvable: () => false,
+  });
+  check('L3 不可解析的包名 → 漂移（整份预设会挂载失败）', broken.ok === false && broken.unresolvable[0]?.id === 'x');
+  check('L4 子路径导出按包根判断可解析面',
+    packageRootOf('@deepseek-ai/dsh-tool-subagent-control/list-agents') === '@deepseek-ai/dsh-tool-subagent-control'
+      && packageRootOf('plain-pkg/sub') === 'plain-pkg');
+  const rawRows = readPresetRows(readFileSync(join(root, 'preset', 'code-pipeline', 'agent.cordis.yml'), 'utf8'), 'agent.cordis.yml');
+  const patchRows = readPresetRows(readFileSync(join(root, 'preset', 'code-pipeline', 'cordis.patch.yml'), 'utf8'), 'cordis.patch.yml');
+  check('L5 生成的 patch 与源组合行数一致（build:preset 未过期）',
+    rawRows.length > 0 && rawRows.length === patchRows.length,
+    JSON.stringify({ raw: rawRows.length, patch: patchRows.length }));
+  check('L5 collectRows 能下钻 cordis:group 子行',
+    collectRows([{ id: 'g', name: 'cordis:group', config: [{ id: 'inner', name: '@deepseek-ai/dsh-tool-fs' }] }]).has('inner'));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// M. 设置卡片文案预算（0.6.0）：常显一行、细则折叠
+// ════════════════════════════════════════════════════════════════════════════
+{
+  const clientSource = readFileSync(join(root, 'lib', 'client.js'), 'utf8');
+  const literals = [
+    ...[...clientSource.matchAll(/\btext:\s*"((?:[^"\\]|\\.)*)"/g)].map((match) => match[1]),
+    ...[...clientSource.matchAll(/\bhint:\s*"((?:[^"\\]|\\.)*)"/g)].map((match) => match[1]),
+  ];
+  const tooLong = literals.filter((value) => value.length > 80);
+  check('M1 常显帮助文案每条 ≤ 80 字符', literals.length > 0 && tooLong.length === 0, JSON.stringify(tooLong));
+  check('M2 长解释走可折叠的 <details>（HelpText 组件）',
+    /React\.createElement\(\s*"details"/.test(clientSource) && /function HelpText\(/.test(clientSource));
+  check('M3 已删除重复的默认模型后缀（下拉框里已经写着）',
+    !clientSource.includes('deepseek-official / deepseek-flash 默认'));
+  check('M4 长解释不再在 intro 与字段里重复（"收尾报告" ≤ 2 处）',
+    (clientSource.match(/收尾报告/g) ?? []).length <= 2, String((clientSource.match(/收尾报告/g) ?? []).length));
 }
 
 check(
